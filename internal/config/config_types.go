@@ -371,6 +371,14 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+
+	// SessionAffinityFollowPriority moves a bound session to the highest available priority
+	// tier when its bound credential is no longer in that tier, instead of keeping the
+	// binding until the credential becomes unavailable. Use it when credential priorities
+	// are re-ranked at runtime (for example by quota) and the new order should apply to
+	// running sessions too, at the cost of one uncached request per move.
+	// Default: false. Ignored when SessionAffinity is false.
+	SessionAffinityFollowPriority bool `yaml:"session-affinity-follow-priority,omitempty" json:"session-affinity-follow-priority,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

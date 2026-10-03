@@ -176,3 +176,69 @@ func expireSessionAffinityPriorityModelCooldown(t *testing.T, manager *Manager, 
 	state.NextRetryAfter = expired
 	state.Quota.NextRecoverAt = expired
 }
+
+func TestSessionAffinityFollowPriorityRebindsWhenOutranked(t *testing.T) {
+	for _, follow := range []bool{false, true} {
+		name := "keeps binding"
+		if follow {
+			name = "follows priority"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := "affinity-follow-" + map[bool]string{false: "off", true: "on"}[follow]
+			model := "affinity-follow-model"
+			boundID := provider + "-bound"
+			risingID := provider + "-rising"
+
+			manager := NewManager(nil, nil, nil)
+			affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+				Fallback:       &RoundRobinSelector{},
+				TTL:            time.Hour,
+				FollowPriority: follow,
+			})
+			defer affinity.Stop()
+			manager.SetSelector(affinity)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: provider})
+
+			register := func(id, priority string) {
+				t.Helper()
+				auth := &Auth{ID: id, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": priority}}
+				if _, errRegister := manager.Register(WithSkipPersist(ctx), auth); errRegister != nil {
+					t.Fatalf("Register(%s): %v", id, errRegister)
+				}
+				registry.GetGlobalRegistry().RegisterClient(id, provider, []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+			}
+			register(boundID, "1")
+			register(risingID, "0")
+
+			opts := cliproxyexecutor.Options{Metadata: map[string]any{
+				cliproxyexecutor.DerivedSessionIDMetadataKey: "follow-session",
+			}}
+			pick := func() *Auth {
+				t.Helper()
+				auth, _, errPick := manager.pickNext(ctx, provider, model, opts, nil)
+				if errPick != nil {
+					t.Fatalf("pick: %v", errPick)
+				}
+				return auth
+			}
+
+			if got := pick(); got.ID != boundID {
+				t.Fatalf("cold binding = %q, want %q", got.ID, boundID)
+			}
+			register(risingID, "2")
+
+			want := boundID
+			if follow {
+				want = risingID
+			}
+			if got := pick(); got.ID != want {
+				t.Fatalf("after re-rank = %q, want %q", got.ID, want)
+			}
+			if got := pick(); got.ID != want {
+				t.Fatalf("binding not sticky after re-rank: %q, want %q", got.ID, want)
+			}
+		})
+	}
+}

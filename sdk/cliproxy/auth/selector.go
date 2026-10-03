@@ -914,6 +914,7 @@ type SessionAffinitySelector struct {
 	cache            *SessionCache
 	matcher          *cliproxysession.MerklePrefixMatcher
 	subagentAffinity bool
+	followPriority   bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -921,6 +922,9 @@ type SessionAffinityConfig struct {
 	Fallback         Selector
 	TTL              time.Duration
 	SubagentAffinity *bool
+	// FollowPriority drops a binding whose credential is below the highest available
+	// priority tier, so the session rebinds within that tier.
+	FollowPriority bool
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -948,7 +952,16 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cache:            NewSessionCache(cfg.TTL),
 		matcher:          cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
 		subagentAffinity: subagentAffinity,
+		followPriority:   cfg.FollowPriority,
 	}
+}
+
+// outranked reports whether a bound credential should give way to a higher priority tier.
+func (s *SessionAffinitySelector) outranked(auth *Auth, topTier []*Auth) bool {
+	if !s.followPriority || auth == nil || len(topTier) == 0 {
+		return false
+	}
+	return authPriority(auth) < authPriority(topTier[0])
 }
 
 // Trees returns a backward-compatible in-memory session tree store.
@@ -1059,12 +1072,15 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				if s.outranked(auth, fallbackAuths) {
+					break
+				}
 				bind(auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
+		// Cached auth not available or outranked, reselect via fallback selector for even distribution
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
@@ -1080,7 +1096,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if fallbackKey != "" {
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
-				if auth.ID == cachedAuthID {
+				if auth.ID == cachedAuthID && !s.outranked(auth, fallbackAuths) {
 					if !isSubagent || s.subagentAffinity {
 						bind(auth.ID)
 						if isFork {
@@ -1145,7 +1161,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 
 	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
 		for _, auth := range available {
-			if auth == nil || auth.ID != match.AuthID {
+			if auth == nil || auth.ID != match.AuthID || s.outranked(auth, highestPriorityAuths(available)) {
 				continue
 			}
 			if match.SessionID != "" {

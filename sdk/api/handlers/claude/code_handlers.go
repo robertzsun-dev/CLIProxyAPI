@@ -328,6 +328,9 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 type claudeErrorDetail struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+	// Details carries Anthropic's structured error details (e.g. error_code
+	// "thread_not_found"), which Claude Code needs to recover from the error.
+	Details json.RawMessage `json:"details,omitempty"`
 }
 
 type claudeErrorResponse struct {
@@ -349,12 +352,13 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 			}
 		}
 	}
-	errType, message := claudeErrorDetailFromText(status, errText)
+	errType, message, details := claudeErrorDetailFromText(status, errText)
 	return claudeErrorResponse{
 		Type: "error",
 		Error: claudeErrorDetail{
 			Type:    errType,
 			Message: message,
+			Details: details,
 		},
 	}
 }
@@ -412,12 +416,13 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	_, _ = c.Writer.Write(body)
 }
 
-func claudeErrorDetailFromText(status int, errText string) (string, string) {
+func claudeErrorDetailFromText(status int, errText string) (string, string, json.RawMessage) {
 	message := strings.TrimSpace(errText)
 	if message == "" {
 		message = http.StatusText(status)
 	}
 	errType := claudeErrorTypeFromStatus(status)
+	var details json.RawMessage
 
 	var payload map[string]any
 	if json.Valid([]byte(message)) {
@@ -431,6 +436,9 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 				} else if c, ok := e["code"].(string); ok && strings.TrimSpace(c) != "" {
 					message = strings.TrimSpace(c)
 				}
+				if d, ok := e["details"].(map[string]any); ok && len(d) > 0 {
+					details, _ = json.Marshal(d)
+				}
 			} else {
 				if t, ok := payload["type"].(string); ok && strings.TrimSpace(t) != "" && strings.TrimSpace(t) != "error" {
 					errType = strings.TrimSpace(t)
@@ -442,7 +450,7 @@ func claudeErrorDetailFromText(status int, errText string) (string, string) {
 		}
 	}
 
-	return errType, message
+	return errType, message, details
 }
 
 func claudeErrorTypeFromStatus(status int) string {

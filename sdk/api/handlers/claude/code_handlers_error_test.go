@@ -51,6 +51,41 @@ func TestClaudeErrorExtractsClaudeStyleUpstreamJSON(t *testing.T) {
 	}
 }
 
+func TestClaudeErrorKeepsUpstreamDetails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusNotFound,
+		Error:      errors.New(`{"type":"error","error":{"type":"not_found_error","message":"No thread state was found for the requested ` + "`previous_message_id`" + `.","details":{"error_code":"thread_not_found"}},"request_id":"req_123"}`),
+	}
+
+	handler.WriteErrorResponse(c, msg)
+
+	body := recorder.Body.Bytes()
+	if got := gjson.GetBytes(body, "error.type").String(); got != "not_found_error" {
+		t.Fatalf("error.type = %q, want not_found_error; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "error.details.error_code").String(); got != "thread_not_found" {
+		t.Fatalf("error.details.error_code = %q, want thread_not_found; body=%s", got, body)
+	}
+}
+
+func TestClaudeErrorOmitsDetailsWhenUpstreamHasNone(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`),
+	}
+
+	got := handler.toClaudeError(msg)
+
+	if got.Error.Details != nil {
+		t.Fatalf("error.details = %s, want omitted", got.Error.Details)
+	}
+}
+
 func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

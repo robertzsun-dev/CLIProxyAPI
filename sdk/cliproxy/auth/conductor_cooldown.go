@@ -1511,7 +1511,25 @@ func shouldSkipCredentialCooldown(err *Error) bool {
 	if err != nil && err.Code == ErrorCodeForceCooldown {
 		return false
 	}
-	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err)
+	return isRequestScopedResultError(err) || isConnectionLifecycleResultError(err) || isTransientTransportResultError(err) ||
+		isProviderOverloadResultError(err)
+}
+
+// statusProviderOverloaded is Anthropic's "overloaded" status (529).
+const statusProviderOverloaded = 529
+
+// isProviderOverloadResultError reports provider-wide overload (Anthropic 529
+// overloaded_error). Overload is not tied to the credential, so cooling the
+// credential only turns a retryable 529 into a local "auth unavailable" 503 for
+// every following request. The request still fails over to the next credential.
+func isProviderOverloadResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if err.HTTPStatus == statusProviderOverloaded {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Message), "overloaded_error")
 }
 
 // isConnectionLifecycleError reports transport/session lifecycle failures that must

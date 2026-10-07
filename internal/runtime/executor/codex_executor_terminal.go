@@ -321,6 +321,12 @@ func newCodexStatusErrWithCooling(statusCode int, body []byte, modelLevelCooling
 	if isCodexModelCapacityError(body) || isUsageLimit {
 		errCode = http.StatusTooManyRequests
 	}
+	if isCodexTurnAuthContextMismatch(body) {
+		// The turn's server-side state lives on another account. Report it like
+		// previous_response_not_found so the client resends the full input and
+		// the credential is neither cooled down nor rotated away.
+		errCode = http.StatusConflict
+	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body), credentialScoped: credentialScoped}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
@@ -366,6 +372,8 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 		return "context_too_large", "invalid_request_error", true
 	case strings.Contains(lower, "invalid signature in thinking block") || strings.Contains(lower, "invalid_encrypted_content"):
 		return "thinking_signature_invalid", "invalid_request_error", true
+	case strings.Contains(lower, "turn auth context mismatch"):
+		return "previous_response_not_found", "invalid_request_error", true
 	case upstreamCode == "previous_response_not_found" || strings.Contains(lower, "previous_response_not_found") || strings.Contains(lower, "previous_response_id") && strings.Contains(lower, "not found"):
 		return "previous_response_not_found", "invalid_request_error", true
 	case statusCode == http.StatusUnauthorized || upstreamType == "authentication_error" || upstreamCode == "invalid_api_key" || strings.Contains(lower, "invalid or expired token") || strings.Contains(lower, "refresh_token_reused"):

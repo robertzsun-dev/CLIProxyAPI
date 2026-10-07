@@ -46,6 +46,10 @@ func parseCodexWebsocketErrorWithCooling(payload []byte, modelLevelCooling bool)
 	}
 
 	out := buildCodexWebsocketErrorPayload(payload, status)
+	if isCodexTurnAuthContextMismatch(out) {
+		status = http.StatusConflict
+		out = classifyCodexStatusError(status, out)
+	}
 	headers := parseCodexWebsocketErrorHeaders(payload)
 	isUsageLimit := isCodexUsageLimitError(out)
 	statusError := statusErr{

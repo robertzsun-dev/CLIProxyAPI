@@ -441,6 +441,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				outputFallback = nil
 			}
 			observeCodexTokenEvent(reporter, payload)
+			observeCodexTurnStateEvent(payload, auth.ID)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
 			// Steering acknowledgements, pending notifications and failures are opaque:
@@ -548,6 +549,12 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			} else if streamErr, body, ok := codexTerminalFailureErrWithCooling(payload, e.modelLevelCooling()); ok {
 				terminalErr = streamErr
 				replayErr = clearCodexReasoningReplayOnInvalidSignature(ctx, eventPrepared.replayScope, streamErr.StatusCode(), body)
+			}
+			if terminalErr != nil && isCodexTurnAuthContextMismatch(payload) {
+				// The upstream socket was opened with another account's turn state.
+				// Drop it so the next request reconnects without that header.
+				noteCodexTurnStateRejection(headers, auth.ID, payload)
+				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "turn_auth_context_mismatch", terminalErr)
 			}
 			if replayErr != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "replay_clear_error", replayErr)

@@ -99,6 +99,15 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 	inputReady := make(chan struct{})
 	writerDone := make(chan struct{})
 	var pendingCreates [][]byte
+	// failingOver is set (under metadataMu) once the reader hands the socket's
+	// unanswered creates back for replay on another credential. From then on the
+	// writer sends nothing upstream and parks every frame in pendingCreates.
+	failingOver := false
+	isFailingOver := func() bool {
+		metadataMu.Lock()
+		defer metadataMu.Unlock()
+		return failingOver
+	}
 	readyForCreate := func() bool {
 		metadataMu.Lock()
 		defer metadataMu.Unlock()
@@ -136,6 +145,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			}
 		}
 		processCreatePayload := func(payload []byte) bool {
+			rawFrame := payload
 			metadataMu.Lock()
 			isAppend := gjson.GetBytes(payload, "type").String() == "response.append"
 			prevID := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String())
@@ -201,7 +211,14 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				return false
 			}
 			payload = buildCodexWebsocketRequestBody(prepared.clientBody)
+			prepared.clientFrame = rawFrame
 			metadataMu.Lock()
+			if failingOver {
+				// Not sent upstream: keep it, in order, for the replay.
+				metadataMu.Unlock()
+				pendingCreates = append([][]byte{rawFrame}, pendingCreates...)
+				return false
+			}
 			if len(pending) >= 16 {
 				metadataMu.Unlock()
 				fail(fmt.Errorf("too many outstanding response.create requests"))
@@ -260,6 +277,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				}
 				if message.Err != nil {
 					fail(message.Err)
+					return
+				}
+				if isFailingOver() {
+					pendingCreates = append(pendingCreates, message.Payload)
 					return
 				}
 				if !cliproxyexecutor.WebsocketAuthEnabled(streamCtx, auth.ID) {
@@ -336,12 +357,23 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 	}()
 	go func() {
 		defer close(out)
+		// failover is set when a queued create was refused for quota before any of
+		// its events reached the client. It is delivered once the writer has
+		// stopped, together with every client frame that was never sent upstream.
+		var failover *cliproxyexecutor.WebsocketCredentialFailoverError
 		defer func() {
 			cancel()
 			// Close releases a writer blocked in the network, then join it before
 			// releasing the execution session. No goroutine outlives its socket.
 			e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "duplex_closed", nil)
 			<-writerDone
+			if failover != nil {
+				failover.Frames = append(failover.Frames, pendingCreates...)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: failover}:
+				case <-ctx.Done():
+				}
+			}
 			sess.clearActive(conn, readCh)
 			unlock()
 		}()
@@ -492,6 +524,43 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					credentialErr = streamErr
 				}
 				var status interface{ StatusCode() int }
+				if errors.As(credentialErr, &status) && status.StatusCode() == http.StatusTooManyRequests {
+					// The account is out of quota. When the refused request is the only
+					// one in flight and none of its events reached the client, hand it
+					// back for a transparent replay on another credential instead of
+					// ending the client's session with the quota error.
+					failedID := gjson.GetBytes(payload, "response.id").String()
+					if failedID == "" {
+						failedID = gjson.GetBytes(payload, "response_id").String()
+					}
+					metadataMu.Lock()
+					var rejected *codexWebsocketPrepared
+					if len(pending) == 1 && len(pending[0].clientFrame) > 0 && !responseActive && !automaticActive &&
+						len(unacknowledgedSteers) == 0 && len(acceptedSteers) == 0 &&
+						(failedID == "" || responseSettings[failedID] == nil) {
+						rejected, pending = pending[0], nil
+						failingOver = true
+					}
+					metadataMu.Unlock()
+					if rejected != nil {
+						failedReporter := helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
+						failedReporter.SetTranslatedReasoningEffort(rejected.clientBody, rejected.to.String())
+						failedReporter.PublishFailure(ctx, credentialErr)
+						helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", credentialErr)
+						// The client keeps sending its handshake turn state on this
+						// downstream socket; it belongs to this account, not the next one.
+						if initial.wsHeaders != nil {
+							codexTurnStates.remember(initial.wsHeaders.Get(codexTurnStateHeader), auth.ID)
+						}
+						failover = &cliproxyexecutor.WebsocketCredentialFailoverError{
+							Cause:        credentialErr,
+							Frames:       [][]byte{rejected.clientFrame},
+							ErrorPayload: bytes.Clone(payload),
+						}
+						log.Infof("codex websockets: credential out of quota, handing request back for replay session=%s auth=%s url=%s", sess.sessionID, auth.ID, initial.wsURL)
+						return
+					}
+				}
 				if errors.As(credentialErr, &status) && (status.StatusCode() == http.StatusUnauthorized || status.StatusCode() == http.StatusForbidden || status.StatusCode() == http.StatusTooManyRequests) {
 					// Account health is independent of which queued request failed.
 					// The conductor records the original classification without replaying

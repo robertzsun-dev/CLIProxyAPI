@@ -221,6 +221,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						}
 						helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap overload rejection after %d lines / %v, time budget exhausted; delivering in-stream", bufferedFrames, timeSinceStart)
 					}
+					if isCodexUsageLimitError(terminalBody) {
+						// The credential is out of quota and nothing has reached the client yet
+						// (the held frames are only handshake events). Fail the attempt so the
+						// conductor cools this credential and retries on another one.
+						helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap usage-limit rejection after %d buffered lines, failing over", bufferedFrames)
+						return nil, streamErr
+					}
 					bootstrapTerminalErr = streamErr
 					break
 				}

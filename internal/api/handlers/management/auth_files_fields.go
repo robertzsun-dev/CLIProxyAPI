@@ -363,6 +363,21 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		} else if rootAuthFileField(fieldPath) == coreauth.AttributeWeight {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "weight does not support nested fields"})
 			return
+		} else if fieldPath == authFieldQuotaOwner {
+			if value == nil {
+				delete(targetAuth.Metadata, authFieldQuotaOwner)
+			} else {
+				raw, _ := value.(string)
+				owner, okOwner := normalizeQuotaOwner(raw)
+				if !okOwner {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "quota_owner must be \"personal\" or \"coworker\""})
+					return
+				}
+				targetAuth.Metadata[authFieldQuotaOwner] = owner
+			}
+		} else if rootAuthFileField(fieldPath) == authFieldQuotaOwner {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "quota_owner does not support nested fields"})
+			return
 		} else if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {

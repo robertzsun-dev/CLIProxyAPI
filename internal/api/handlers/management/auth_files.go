@@ -471,6 +471,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 			if requestRetry, okRetry := authFileRequestRetryFromJSON(data); okRetry {
 				fileData["request_retry"] = requestRetry
 			}
+			if owner, okOwner := normalizeQuotaOwner(gjson.GetBytes(data, authFieldQuotaOwner).String()); okOwner {
+				fileData[authFieldQuotaOwner] = owner
+			}
 		}
 
 		files = append(files, fileData)
@@ -784,7 +787,36 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		entry["request_retry"] = requestRetry
 	}
+	if owner, ok := authQuotaOwnerValue(auth); ok {
+		entry[authFieldQuotaOwner] = owner
+	}
 	return entry
+}
+
+// authFieldQuotaOwner is an operator-defined auth file field ("personal" or
+// "coworker") that external quota tooling reads to decide whether an account
+// keeps a reserve. The proxy itself does not route on it; it only stores it
+// (PATCH /credentials/fields) and lists it.
+const authFieldQuotaOwner = "quota_owner"
+
+func normalizeQuotaOwner(raw string) (string, bool) {
+	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
+	case "personal", "coworker":
+		return value, true
+	default:
+		return "", false
+	}
+}
+
+func authQuotaOwnerValue(auth *coreauth.Auth) (string, bool) {
+	if auth == nil || auth.Metadata == nil {
+		return "", false
+	}
+	raw, ok := auth.Metadata[authFieldQuotaOwner].(string)
+	if !ok {
+		return "", false
+	}
+	return normalizeQuotaOwner(raw)
 }
 
 func authFileRequestRetryFromJSON(data []byte) (int, bool) {

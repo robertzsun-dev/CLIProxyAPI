@@ -88,9 +88,6 @@ func (s *Service) Run(ctx context.Context) error {
 			includeBaseline: true,
 			auths:           s.coreManager.List(),
 		})
-		interval := 15 * time.Minute
-		s.coreManager.StartAutoRefresh(ctx, interval)
-		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 
 	if !homeEnabled {
@@ -162,15 +159,22 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.serverErr = make(chan error, 1)
+	serverReady := make(chan struct{})
 	go func() {
-		if errStart := s.server.Start(); errStart != nil {
+		if errStart := s.server.StartWithReady(func() { close(serverReady) }); errStart != nil {
 			s.serverErr <- errStart
 		} else {
 			s.serverErr <- nil
 		}
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case errServer := <-s.serverErr:
+		return errServer
+	case <-serverReady:
+	}
 	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
 
 	s.applyPprofConfig(s.cfg)
@@ -206,6 +210,12 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.registerModelRefreshCallback()
+	if s.coreManager != nil && !homeEnabled && ctx.Err() == nil {
+		// Failed startup must not consume rotating tokens that cannot be saved.
+		interval := 15 * time.Minute
+		s.coreManager.StartAutoRefresh(ctx, interval)
+		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+	}
 
 	select {
 	case <-ctx.Done():

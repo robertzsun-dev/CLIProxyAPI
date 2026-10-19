@@ -285,6 +285,12 @@ func (s *Server) Handler() http.Handler {
 // Returns:
 //   - error: An error if the server fails to start
 func (s *Server) Start() error {
+	return s.StartWithReady(nil)
+}
+
+// StartWithReady calls onReady after the listener and TLS configuration are ready.
+// Like Start, it blocks until the server stops or fails.
+func (s *Server) StartWithReady(onReady func()) error {
 	if s == nil || s.server == nil {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
@@ -343,6 +349,9 @@ func (s *Server) Start() error {
 	go func() {
 		acceptErrCh <- s.acceptMuxConnections(listener, httpListener)
 	}()
+	if onReady != nil {
+		onReady()
+	}
 
 	select {
 	case errServe := <-httpErrCh:

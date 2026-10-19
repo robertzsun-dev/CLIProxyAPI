@@ -44,17 +44,11 @@ const (
 // every few seconds and triggers refresh operations when required.
 // Only one loop is kept alive; starting a new one cancels the previous run.
 func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duration) {
+	m.refreshLifecycleMu.Lock()
+	defer m.refreshLifecycleMu.Unlock()
+	m.stopAutoRefresh()
 	if interval <= 0 {
 		interval = refreshCheckInterval
-	}
-
-	m.mu.Lock()
-	cancelPrev := m.refreshCancel
-	m.refreshCancel = nil
-	m.refreshLoop = nil
-	m.mu.Unlock()
-	if cancelPrev != nil {
-		cancelPrev()
 	}
 
 	ctx, cancelCtx := context.WithCancel(parent)
@@ -70,21 +64,31 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	go loop.run(ctx)
 }
 
-// StopAutoRefresh cancels the background refresh loop, if running.
+// StopAutoRefresh stops scheduling and waits for active refreshes to be persisted.
 // It also stops the selector if it implements StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
+	m.refreshLifecycleMu.Lock()
+	defer m.refreshLifecycleMu.Unlock()
+	m.stopAutoRefresh()
+	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
+	sel := m.Selector()
+	if stoppable, ok := sel.(StoppableSelector); ok && stoppable != nil {
+		stoppable.Stop()
+	}
+}
+
+func (m *Manager) stopAutoRefresh() {
 	m.mu.Lock()
 	cancel := m.refreshCancel
+	loop := m.refreshLoop
 	m.refreshCancel = nil
 	m.refreshLoop = nil
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
-	}
-	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
-	sel := m.Selector()
-	if stoppable, ok := sel.(StoppableSelector); ok && stoppable != nil {
-		stoppable.Stop()
+		if loop != nil {
+			<-loop.done
+		}
 	}
 }
 

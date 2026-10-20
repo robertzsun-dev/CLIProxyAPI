@@ -136,6 +136,43 @@ func (h *Handler) APICall(c *gin.Context) {
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
 
+	perform := func() (apiCallResponse, error) {
+		resp, errCall := h.performAPICall(c.Request.Context(), body, method, urlStr, requestProxyURL, authIndex, auth)
+		if errCall != nil {
+			return resp, errCall
+		}
+		return resp, nil
+	}
+	var (
+		resp    apiCallResponse
+		errCall error
+	)
+	if isUsageEndpoint(method, parsedURL) {
+		resp, errCall = apiCallUsageCache.fetch(authIndex+"\x00"+urlStr, perform)
+	} else {
+		resp, errCall = perform()
+	}
+	if errCall != nil {
+		status := http.StatusBadGateway
+		if callErr, ok := errCall.(*apiCallError); ok {
+			status = callErr.status
+		}
+		c.JSON(status, gin.H{"error": errCall.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// apiCallError carries the HTTP status an api-call failure is reported with.
+type apiCallError struct {
+	status  int
+	message string
+}
+
+func (e *apiCallError) Error() string { return e.message }
+
+// performAPICall sends one api-call request upstream and returns its response.
+func (h *Handler) performAPICall(ctx context.Context, body apiCallRequest, method, urlStr, requestProxyURL, authIndex string, auth *coreauth.Auth) (apiCallResponse, *apiCallError) {
 	reqHeaders := body.Header
 	if reqHeaders == nil {
 		reqHeaders = map[string]string{}
@@ -148,7 +185,7 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	resolveToken := func() error {
 		if !tokenResolved {
-			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth, requestProxyURL)
+			token, tokenErr = h.resolveTokenForAuth(ctx, auth, requestProxyURL)
 			tokenResolved = true
 		}
 		if token == "" {
@@ -168,16 +205,14 @@ func (h *Handler) APICall(c *gin.Context) {
 			continue
 		}
 		if errToken := resolveToken(); errToken != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errToken.Error()})
-			return
+			return apiCallResponse{}, &apiCallError{status: http.StatusBadRequest, message: errToken.Error()}
 		}
 		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
 	}
 
 	if strings.Contains(body.Data, "$TOKEN$") {
 		if errToken := resolveToken(); errToken != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errToken.Error()})
-			return
+			return apiCallResponse{}, &apiCallError{status: http.StatusBadRequest, message: errToken.Error()}
 		}
 		replacement := token
 		if json.Valid([]byte(body.Data)) && strings.ContainsAny(token, "\"\\\r\n\t") {
@@ -193,10 +228,9 @@ func (h *Handler) APICall(c *gin.Context) {
 		requestBody = strings.NewReader(body.Data)
 	}
 
-	req, errNewRequest := http.NewRequestWithContext(c.Request.Context(), method, urlStr, requestBody)
+	req, errNewRequest := http.NewRequestWithContext(ctx, method, urlStr, requestBody)
 	if errNewRequest != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to build request"})
-		return
+		return apiCallResponse{}, &apiCallError{status: http.StatusBadRequest, message: "failed to build request"}
 	}
 
 	for key, value := range reqHeaders {
@@ -218,8 +252,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
 		log.WithError(errDo).Debug("management APICall request failed")
-		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
-		return
+		return apiCallResponse{}, &apiCallError{status: http.StatusBadGateway, message: "request failed"}
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -229,15 +262,14 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	respBody, errReadAll := io.ReadAll(resp.Body)
 	if errReadAll != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
-		return
+		return apiCallResponse{}, &apiCallError{status: http.StatusBadGateway, message: "failed to read response"}
 	}
 
-	c.JSON(http.StatusOK, apiCallResponse{
+	return apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
-	})
+	}, nil
 }
 
 func firstNonEmptyString(values ...*string) string {

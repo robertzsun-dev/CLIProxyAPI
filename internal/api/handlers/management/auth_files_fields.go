@@ -378,6 +378,20 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		} else if rootAuthFileField(fieldPath) == authFieldQuotaOwner {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "quota_owner does not support nested fields"})
 			return
+		} else if fieldPath == authFieldQuotaBurn {
+			burn, okBurn := normalizeQuotaBurn(value)
+			if !okBurn {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "quota_burn must be true, false, null or a unix time in seconds"})
+				return
+			}
+			if burn == nil {
+				delete(targetAuth.Metadata, authFieldQuotaBurn)
+			} else {
+				targetAuth.Metadata[authFieldQuotaBurn] = burn
+			}
+		} else if rootAuthFileField(fieldPath) == authFieldQuotaBurn {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "quota_burn does not support nested fields"})
+			return
 		} else if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {

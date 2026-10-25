@@ -485,19 +485,31 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		pinnedAuthID = ""
 	}
 
+	// replayFrames are client frames handed back by a Codex duplex stream whose
+	// credential ran out of quota before answering them. They are processed
+	// before any new downstream input, on whichever credential is selected next.
+	var replayFrames [][]byte
+	var replayQuotaFallback []byte
 	for {
 		var msgType int
 		var payload []byte
 		var errReadMessage error
-		select {
-		case message, ok := <-input:
-			if !ok {
+		var quotaFallback []byte
+		if len(replayFrames) > 0 {
+			msgType, payload = websocket.TextMessage, replayFrames[0]
+			replayFrames = replayFrames[1:]
+			quotaFallback, replayQuotaFallback = replayQuotaFallback, nil
+		} else {
+			select {
+			case message, ok := <-input:
+				if !ok {
+					errReadMessage = context.Cause(socketCtx)
+				} else {
+					msgType, payload, errReadMessage = websocket.TextMessage, message.Payload, message.Err
+				}
+			case <-socketCtx.Done():
 				errReadMessage = context.Cause(socketCtx)
-			} else {
-				msgType, payload, errReadMessage = websocket.TextMessage, message.Payload, message.Err
 			}
-		case <-socketCtx.Done():
-			errReadMessage = context.Cause(socketCtx)
 		}
 		if errReadMessage != nil && errors.Is(errReadMessage, context.Canceled) {
 			return
@@ -867,6 +879,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				toolCacheTurn:            toolCacheTurn,
 				suppressError:            replayPinnedAuthFailure,
 				localInterrupt:           localInterrupt,
+				quotaFallback:            quotaFallback,
 			},
 		)
 		if errForward != nil {
@@ -883,6 +896,24 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			return
 		}
 		if forwardErrMsg != nil {
+			if failover, ok := cliproxyexecutor.AsWebsocketCredentialFailover(forwardErrMsg.Error); ok {
+				// The bound credential ran out of quota before answering. It is cooling
+				// now, so the next execution selects another account on a fresh upstream
+				// socket. Conversation state does not move between accounts.
+				forgetPinnedAuth()
+				upstreamMode = responsesWebsocketUpstreamModeUnknown
+				upstreamWebsocketAuthID = ""
+				frames, errWrite := h.replayResponsesWebsocketAfterCredentialFailover(c, writer, wsTimelineLog, passthroughSessionID, lastAttemptedAuthID, failover)
+				if errWrite != nil {
+					wsTerminateErr = errWrite
+					return
+				}
+				if len(frames) > 0 && len(frames) == len(failover.Frames) {
+					replayQuotaFallback = failover.ErrorPayload
+				}
+				replayFrames = append(frames, replayFrames...)
+				continue
+			}
 			if pinnedAuthAttempted && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
 				forgetPinnedAuth()
 			}
@@ -960,6 +991,43 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			lastResponsePendingToolCallIDs = append([]string(nil), completedPendingToolCallIDs...)
 		}
 	}
+}
+
+// replayResponsesWebsocketAfterCredentialFailover returns the frames to replay
+// on another credential after a quota failover. A request that continues a
+// previous response cannot be replayed: that response lives on the exhausted
+// account and the duplex proxy does not hold the full transcript. The client
+// gets previous_response_not_found for it and resends the full conversation.
+func (h *OpenAIResponsesAPIHandler) replayResponsesWebsocketAfterCredentialFailover(
+	c *gin.Context,
+	writer *responsesWebsocketWriter,
+	wsTimelineLog websocketTimelineAppender,
+	sessionID string,
+	authID string,
+	failover *cliproxyexecutor.WebsocketCredentialFailoverError,
+) ([][]byte, error) {
+	frames := append([][]byte(nil), failover.Frames...)
+	if len(frames) > 0 && responsesWebsocketRequestRequiresCurrentUpstream(frames[0]) {
+		log.Infof("responses websocket: credential out of quota, asking client to resend full input id=%s auth=%s", sessionID, authID)
+		errMsg := responsesWebsocketPreviousResponseNotFoundError()
+		if h != nil {
+			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+		}
+		errorPayload, errWrite := writeResponsesWebsocketError(writer, wsTimelineLog, errMsg)
+		if errWrite != nil {
+			return nil, errWrite
+		}
+		log.Infof(
+			"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+			sessionID,
+			websocket.TextMessage,
+			websocketPayloadEventType(errorPayload),
+			websocketPayloadPreview(errorPayload),
+		)
+		return frames[1:], nil
+	}
+	log.Infof("responses websocket: credential out of quota, replaying %d request(s) on another credential id=%s auth=%s", len(frames), sessionID, authID)
+	return frames, nil
 }
 
 type responsesWebsocketObservedCompactionState struct {

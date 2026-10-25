@@ -518,9 +518,9 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 }
 
 type claudeErrorDetail struct {
-	Type    string              `json:"type"`
-	Message string              `json:"message"`
-	Details *claudeErrorDetails `json:"details,omitempty"`
+	Type    string          `json:"type"`
+	Message string          `json:"message"`
+	Details json.RawMessage `json:"details,omitempty"`
 }
 
 type claudeErrorDetails struct {
@@ -554,8 +554,16 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 			Message: message,
 		},
 	}
+	var upstream struct {
+		Error struct {
+			Details json.RawMessage `json:"details"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(errText), &upstream) == nil {
+		response.Error.Details = upstream.Error.Details
+	}
 	if clienterror.IsClaudeThreadNotFound(status, errors.New(errText)) {
-		response.Error.Details = &claudeErrorDetails{ErrorCode: "thread_not_found"}
+		response.Error.Details = json.RawMessage(`{"error_code":"thread_not_found"}`)
 	}
 	return response
 }

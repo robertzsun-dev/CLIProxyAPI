@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -28,6 +29,10 @@ type responsesWebsocketForwardOptions struct {
 	suppressError            func(*interfaces.ErrorMessage) bool
 	keepAliveInterval        *time.Duration
 	localInterrupt           *responsesLocalInterrupt
+	// quotaFallback is the upstream quota error of a request that is being
+	// replayed after a credential failover. If the replay fails before any
+	// event reaches the client, the client gets this original error instead.
+	quotaFallback []byte
 }
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
@@ -99,12 +104,39 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
 			}
 
+			if _, ok := cliproxyexecutor.AsWebsocketCredentialFailover(errMsg.Error); ok {
+				// Nothing of the refused request reached the client; the caller
+				// replays it on another credential.
+				cancel(errMsg.Error)
+				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
+			}
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 			if opts.suppressError != nil && opts.suppressError(errMsg) {
 				cancel(errMsg.Error)
 				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
 			}
 			markAPIResponseTimestamp(c)
+			if len(opts.quotaFallback) > 0 && !responseStarted && !clienterror.IsRequestFault(responsesWebsocketErrorStatus(errMsg), errMsg.Error) {
+				// No credential could take the replay: report the original quota error.
+				wrote, errClose := writer.closeWithPayload(opts.quotaFallback)
+				if wrote {
+					if wsTimelineLog != nil {
+						wsTimelineLog.Append("response", opts.quotaFallback, time.Now())
+					}
+					log.Infof(
+						"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+						sessionID,
+						websocket.TextMessage,
+						websocketPayloadEventType(opts.quotaFallback),
+						websocketPayloadPreview(opts.quotaFallback),
+					)
+				}
+				cancel(errMsg.Error)
+				if errClose == nil {
+					errClose = websocket.ErrCloseSent
+				}
+				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errClose
+			}
 			if matched, errClose := writer.closeForUpstreamError(errMsg.Error); matched {
 				cancel(errMsg.Error)
 				if errClose != nil {
@@ -130,6 +162,23 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				if opts.duplexStream != nil && opts.duplexStream() {
 					// A duplex stream ends with its socket, not an individual response.
 					// The data channel may close before select observes its final error.
+					// A credential failover must still win so the request is replayed.
+					if errs != nil {
+						select {
+						case errMsg, okErr := <-errs:
+							if okErr && errMsg != nil {
+								// Handle the final error exactly as if select had seen it first.
+								final := make(chan *interfaces.ErrorMessage, 1)
+								final <- errMsg
+								errs, data = final, nil
+								continue
+							}
+							if !okErr {
+								errs = nil
+							}
+						default:
+						}
+					}
 					_, errClose := writer.closeWithoutError()
 					cancel(nil)
 					if errClose != nil {

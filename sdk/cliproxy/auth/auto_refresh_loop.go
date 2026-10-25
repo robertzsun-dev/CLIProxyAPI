@@ -16,6 +16,11 @@ import (
 // up promptly to detect and refresh any credentials that expired during sleep.
 const maxRefreshTimerWait = 30 * time.Second
 
+// A started refresh may already have consumed a rotating token upstream.
+// Give credential acquisition and persistence a bounded lifetime independent
+// of scheduler cancellation during shutdown.
+const autoRefreshTimeout = 30 * time.Second
+
 type authAutoRefreshLoop struct {
 	manager     *Manager
 	interval    time.Duration
@@ -28,6 +33,7 @@ type authAutoRefreshLoop struct {
 
 	wakeCh chan struct{}
 	jobs   chan *authRefreshJob
+	done   chan struct{}
 }
 
 type authRefreshJob struct {
@@ -57,6 +63,7 @@ func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrenc
 		dirty:       make(map[string]struct{}),
 		wakeCh:      make(chan struct{}, 1),
 		jobs:        make(chan *authRefreshJob, jobBuffer),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -78,14 +85,23 @@ func (l *authAutoRefreshLoop) run(ctx context.Context) {
 		return
 	}
 
-	defer l.releaseQueuedJobs()
+	var workerGroup sync.WaitGroup
+	defer func() {
+		workerGroup.Wait()
+		l.releaseQueuedJobs()
+		close(l.done)
+	}()
 
 	workers := l.concurrency
 	if workers <= 0 {
 		workers = refreshMaxConcurrency
 	}
 	for i := 0; i < workers; i++ {
-		go l.worker(ctx)
+		workerGroup.Add(1)
+		go func() {
+			defer workerGroup.Done()
+			l.worker(ctx)
+		}()
 	}
 
 	l.loop(ctx)
@@ -101,7 +117,9 @@ func (l *authAutoRefreshLoop) worker(ctx context.Context) {
 				continue
 			}
 			if l.manager.beginRefreshJob(ctx, job) {
-				_, _ = l.manager.refreshAuthForRequestAtEpoch(ctx, job.id, "", job.registrationEpoch)
+				refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), autoRefreshTimeout)
+				_, _ = l.manager.refreshAuthForRequestAtEpoch(refreshCtx, job.id, "", job.registrationEpoch)
+				cancelRefresh()
 			}
 			l.manager.finishRefreshJob(job, time.Time{}, false)
 		}

@@ -417,6 +417,31 @@ func applyAuthFileFieldsPatch(targetAuth *coreauth.Auth, req map[string]json.Raw
 			}
 		} else if rootAuthFileField(fieldPath) == coreauth.AttributeWeight {
 			return &authFileFieldPatchError{message: "weight does not support nested fields"}
+		} else if fieldPath == authFieldQuotaOwner {
+			if value == nil {
+				delete(targetAuth.Metadata, authFieldQuotaOwner)
+			} else {
+				raw, _ := value.(string)
+				owner, okOwner := normalizeQuotaOwner(raw)
+				if !okOwner {
+					return &authFileFieldPatchError{message: "quota_owner must be \"personal\" or \"coworker\""}
+				}
+				targetAuth.Metadata[authFieldQuotaOwner] = owner
+			}
+		} else if rootAuthFileField(fieldPath) == authFieldQuotaOwner {
+			return &authFileFieldPatchError{message: "quota_owner does not support nested fields"}
+		} else if fieldPath == authFieldQuotaBurn {
+			burn, okBurn := normalizeQuotaBurn(value)
+			if !okBurn {
+				return &authFileFieldPatchError{message: "quota_burn must be true, false, null or a unix time in seconds"}
+			}
+			if burn == nil {
+				delete(targetAuth.Metadata, authFieldQuotaBurn)
+			} else {
+				targetAuth.Metadata[authFieldQuotaBurn] = burn
+			}
+		} else if rootAuthFileField(fieldPath) == authFieldQuotaBurn {
+			return &authFileFieldPatchError{message: "quota_burn does not support nested fields"}
 		} else if fieldPath == "headers" {
 			applyAuthFileHeadersPatch(targetAuth, value)
 		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {

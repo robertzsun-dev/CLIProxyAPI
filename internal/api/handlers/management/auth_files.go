@@ -472,6 +472,14 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 			if requestRetry, okRetry := authFileRequestRetryFromJSON(data); okRetry {
 				fileData["request_retry"] = requestRetry
 			}
+			if owner, okOwner := normalizeQuotaOwner(gjson.GetBytes(data, authFieldQuotaOwner).String()); okOwner {
+				fileData[authFieldQuotaOwner] = owner
+			}
+			if bv := gjson.GetBytes(data, authFieldQuotaBurn); bv.Exists() {
+				if burn, okBurn := normalizeQuotaBurn(bv.Value()); okBurn && burn != nil {
+					fileData[authFieldQuotaBurn] = burn
+				}
+			}
 		}
 
 		files = append(files, fileData)
@@ -797,7 +805,84 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 			entry["siwc_expires_at"] = expiry.UTC().Format(time.RFC3339)
 		}
 	}
+	if owner, ok := authQuotaOwnerValue(auth); ok {
+		entry[authFieldQuotaOwner] = owner
+	}
+	if auth != nil && auth.Metadata != nil {
+		if burn, ok := normalizeQuotaBurn(auth.Metadata[authFieldQuotaBurn]); ok && burn != nil {
+			entry[authFieldQuotaBurn] = burn
+		}
+	}
 	return entry
+}
+
+// authFieldQuotaOwner is an operator-defined auth file field ("personal" or
+// "coworker") that external quota tooling reads to decide whether an account
+// keeps a reserve. The proxy itself does not route on it; it only stores it
+// (PATCH /credentials/fields) and lists it.
+const authFieldQuotaOwner = "quota_owner"
+
+func normalizeQuotaOwner(raw string) (string, bool) {
+	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
+	case "personal", "coworker":
+		return value, true
+	default:
+		return "", false
+	}
+}
+
+// authFieldQuotaBurn is an operator-defined auth file field that tells the
+// quota guard to use an account fully, ahead of every other account, until
+// its weekly limit resets. true means "requested": the guard replaces it with
+// the reset time (unix seconds) and clears the field once that time passes.
+// Like quota_owner, the proxy only stores and lists it.
+const authFieldQuotaBurn = "quota_burn"
+
+// normalizeQuotaBurn returns true, a positive unix time (int64), or nil for
+// "off" (false or null). ok is false for any other value.
+func normalizeQuotaBurn(value any) (any, bool) {
+	switch v := value.(type) {
+	case nil:
+		return nil, true
+	case bool:
+		if v {
+			return true, true
+		}
+		return nil, true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil || n <= 0 {
+			return nil, false
+		}
+		return n, true
+	case float64:
+		if v <= 0 || v != float64(int64(v)) {
+			return nil, false
+		}
+		return int64(v), true
+	case int64:
+		if v <= 0 {
+			return nil, false
+		}
+		return v, true
+	case int:
+		if v <= 0 {
+			return nil, false
+		}
+		return int64(v), true
+	}
+	return nil, false
+}
+
+func authQuotaOwnerValue(auth *coreauth.Auth) (string, bool) {
+	if auth == nil || auth.Metadata == nil {
+		return "", false
+	}
+	raw, ok := auth.Metadata[authFieldQuotaOwner].(string)
+	if !ok {
+		return "", false
+	}
+	return normalizeQuotaOwner(raw)
 }
 
 func authFileRequestRetryFromJSON(data []byte) (int, bool) {

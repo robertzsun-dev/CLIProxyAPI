@@ -3,7 +3,15 @@
 Go 1.26+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with OAuth and round-robin load balancing.
 
 ## Repository
-- GitHub: https://github.com/router-for-me/CLIProxyAPI
+- Canonical fork: https://github.com/robertzsun-dev/CLIProxyAPI (`origin`).
+- Upstream: https://github.com/router-for-me/CLIProxyAPI (`upstream`).
+- Production builds come from the fork's `main`, never directly from upstream.
+- Upgrade by fetching and merging `upstream/main` into our `main`. Use `scripts/merge-upstream.sh`.
+- Never reset/rebase our main onto upstream, replace it with upstream files, or force-push main.
+- Resolve conflicts by preserving both upstream fixes and our custom behavior. Do not select whole-file ours/theirs as a shortcut.
+- Before deploying, run the regression tests for quota ownership/burn, quota caching and cooldown, priority affinity, credential switchover, websocket quota failover and interrupts, Muse filtering, and startup refresh ordering.
+- Verify both the previous fork main and the fetched upstream head are ancestors of the merge. Push normally and deploy the exact pushed commit.
+- Any intentional removal of custom behavior requires explicit user authorization naming that behavior; a request to upgrade upstream is not authorization to remove it.
 
 ## Commands
 ```bash

@@ -692,6 +692,9 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 		conn, closer, resp, err := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 		if conn != nil {
 			configureRawCodexWebsocketConn(conn, authID, wsURL)
+			if resp != nil {
+				rememberCodexTurnStateFromHeaders(resp.Header, authID)
+			}
 		}
 		return conn, closer, resp, err
 	}
@@ -730,6 +733,9 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithSIWC(ctx context.Context
 	conn, closer, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 	if errDial != nil {
 		return nil, closer, resp, errDial
+	}
+	if resp != nil {
+		rememberCodexTurnStateFromHeaders(resp.Header, authID)
 	}
 
 	sess.connMu.Lock()

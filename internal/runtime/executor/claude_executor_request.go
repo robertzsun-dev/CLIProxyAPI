@@ -807,13 +807,16 @@ func (e claudeRateLimitError) IsRequestScoped() bool {
 // next one, which returns the same 429. A single speed:"fast" request would walk
 // the whole Claude pool and cool down every credential, all of which remain
 // perfectly healthy for ordinary traffic. The refusal belongs to the request.
+// claudeStatusOverloaded is Anthropic's 529 overloaded_error status.
+const claudeStatusOverloaded = 529
+
 func classifyClaudeUpstreamError(statusCode int, headers http.Header, body []byte) error {
 	return classifyClaudeUpstreamErrorWithCooling(statusCode, headers, body, false)
 }
 
 func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header, body []byte, modelLevelCooling bool) error {
 	var retryAfter *time.Duration
-	if statusCode == http.StatusTooManyRequests || (statusCode >= 400 && statusCode < 600) {
+	if statusCode == http.StatusTooManyRequests || (statusCode >= 400 && statusCode < 600 && statusCode != claudeStatusOverloaded) {
 		retryAfter = helps.ParseClaudeRateLimitResetForError(headers, body, time.Now())
 	}
 	err := statusErr{code: statusCode, msg: string(body), retryAfter: retryAfter}

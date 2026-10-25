@@ -3,6 +3,7 @@ package management
 import (
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,9 +25,63 @@ type usageCacheEntry struct {
 }
 
 type usageCache struct {
-	mu      sync.Mutex
-	entries map[string]usageCacheEntry
-	group   singleflight.Group
+	mu        sync.Mutex
+	entries   map[string]usageCacheEntry
+	group     singleflight.Group
+	cooldowns map[string]usageCooldown
+	now       func() time.Time
+}
+
+type usageCooldown struct {
+	resp  apiCallResponse
+	until time.Time
+}
+
+func (c *usageCache) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+func (c *usageCache) cooling(key string) (apiCallResponse, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.cooldowns[key]
+	if !ok || !c.clock().Before(v.until) {
+		delete(c.cooldowns, key)
+		return apiCallResponse{}, false
+	}
+	if old, exists := c.entries[key]; exists && c.clock().Sub(old.fetched) <= usageCacheStale {
+		resp := old.resp
+		resp.Header = http.Header(resp.Header).Clone()
+		if resp.Header == nil {
+			resp.Header = make(http.Header)
+		}
+		http.Header(resp.Header).Set("X-Quota-Cache", "stale")
+		http.Header(resp.Header).Set("Age", strconv.FormatInt(int64(c.clock().Sub(old.fetched).Seconds()), 10))
+		return resp, true
+	}
+	return v.resp, true
+}
+func (c *usageCache) cool(key string, resp apiCallResponse) {
+	now := c.clock()
+	until := now.Add(5 * time.Minute)
+	if seconds, err := strconv.Atoi(http.Header(resp.Header).Get("Retry-After")); err == nil && seconds > 0 {
+		until = now.Add(time.Duration(seconds) * time.Second)
+	} else if date, err := http.ParseTime(http.Header(resp.Header).Get("Retry-After")); err == nil && date.After(now) {
+		until = date
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cooldowns == nil {
+		c.cooldowns = make(map[string]usageCooldown)
+	}
+	for k, v := range c.cooldowns {
+		if !now.Before(v.until) {
+			delete(c.cooldowns, k)
+		}
+	}
+	c.cooldowns[key] = usageCooldown{resp: resp, until: until}
 }
 
 var apiCallUsageCache = &usageCache{entries: make(map[string]usageCacheEntry)}
@@ -50,7 +105,7 @@ func (c *usageCache) get(key string, maxAge time.Duration) (apiCallResponse, boo
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[key]
-	if !ok || time.Since(entry.fetched) > maxAge {
+	if !ok || c.clock().Sub(entry.fetched) > maxAge {
 		return apiCallResponse{}, false
 	}
 	return entry.resp, true
@@ -59,9 +114,9 @@ func (c *usageCache) get(key string, maxAge time.Duration) (apiCallResponse, boo
 func (c *usageCache) put(key string, resp apiCallResponse) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = usageCacheEntry{resp: resp, fetched: time.Now()}
+	c.entries[key] = usageCacheEntry{resp: resp, fetched: c.clock()}
 	for k, entry := range c.entries {
-		if time.Since(entry.fetched) > usageCacheStale {
+		if c.clock().Sub(entry.fetched) > usageCacheStale {
 			delete(c.entries, k)
 		}
 	}
@@ -71,10 +126,16 @@ func (c *usageCache) put(key string, resp apiCallResponse) {
 // callers. A 429 from upstream is answered with the last good reading if one
 // is younger than usageCacheStale.
 func (c *usageCache) fetch(key string, do func() (apiCallResponse, error)) (apiCallResponse, error) {
+	if resp, ok := c.cooling(key); ok {
+		return resp, nil
+	}
 	if resp, ok := c.get(key, usageCacheFresh); ok {
 		return resp, nil
 	}
 	value, err, _ := c.group.Do(key, func() (any, error) {
+		if resp, ok := c.cooling(key); ok {
+			return resp, nil
+		}
 		if resp, ok := c.get(key, usageCacheFresh); ok {
 			return resp, nil
 		}
@@ -85,7 +146,8 @@ func (c *usageCache) fetch(key string, do func() (apiCallResponse, error)) (apiC
 		if resp.StatusCode == http.StatusOK {
 			c.put(key, resp)
 		} else if resp.StatusCode == http.StatusTooManyRequests {
-			if stale, ok := c.get(key, usageCacheStale); ok {
+			c.cool(key, resp)
+			if stale, ok := c.cooling(key); ok {
 				return stale, nil
 			}
 		}

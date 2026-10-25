@@ -147,7 +147,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		resp    apiCallResponse
 		errCall error
 	)
-	if isUsageEndpoint(method, parsedURL) {
+	if isUsageEndpoint(method, parsedURL) && auth != nil && authIndex != "" && strings.EqualFold(body.Header["Authorization"], "Bearer $TOKEN$") {
 		resp, errCall = apiCallUsageCache.fetch(authIndex+"\x00"+urlStr, perform)
 	} else {
 		resp, errCall = perform()

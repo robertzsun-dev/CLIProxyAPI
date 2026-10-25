@@ -1,6 +1,7 @@
 package management
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
@@ -33,7 +34,7 @@ func TestUsageCacheSharesFreshReadings(t *testing.T) {
 	var calls atomic.Int32
 	do := func() (apiCallResponse, error) {
 		calls.Add(1)
-		time.Sleep(10 * time.Millisecond) // keep concurrent callers overlapping
+
 		return apiCallResponse{StatusCode: http.StatusOK, Body: "fresh"}, nil
 	}
 	var wg sync.WaitGroup
@@ -69,5 +70,47 @@ func TestUsageCacheServesLastGoodReadingOn429(t *testing.T) {
 	resp, _ = cache.fetch("other", limited)
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("with no earlier reading the 429 must pass through, got %+v", resp)
+	}
+}
+
+func TestUsageCacheCooldownAndExpiry(t *testing.T) {
+	for _, warm := range []bool{false, true} {
+		t.Run(fmt.Sprint(warm), func(t *testing.T) {
+			now := time.Now()
+			c := &usageCache{entries: make(map[string]usageCacheEntry), now: func() time.Time { return now }}
+			if warm {
+				c.entries["a"] = usageCacheEntry{resp: apiCallResponse{StatusCode: 200, Body: "old"}, fetched: now.Add(-2 * time.Minute)}
+			}
+			calls := 0
+			fetch := func() (apiCallResponse, error) {
+				calls++
+				return apiCallResponse{StatusCode: 429, Header: http.Header{"Retry-After": []string{"600"}}}, nil
+			}
+			for range 3 {
+				r, err := c.fetch("a", fetch)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if warm && (r.Body != "old" || http.Header(r.Header).Get("X-Quota-Cache") != "stale") {
+					t.Fatalf("missing marked stale reading: %+v", r)
+				}
+				if !warm && r.StatusCode != 429 {
+					t.Fatal("must not fabricate quota")
+				}
+			}
+			if calls != 1 {
+				t.Fatalf("calls %d", calls)
+			}
+			now = now.Add(9 * time.Minute)
+			c.fetch("a", fetch)
+			if calls != 1 {
+				t.Fatal("ignored retry-after")
+			}
+			now = now.Add(2 * time.Minute)
+			c.fetch("a", fetch)
+			if calls != 2 {
+				t.Fatal("did not retry after cooldown")
+			}
+		})
 	}
 }

@@ -1,0 +1,6 @@
+[Unit]
+Description=Protect pooled coworker weekly and work-hours Claude session quotas
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/cliproxyapi/quota-guard.py

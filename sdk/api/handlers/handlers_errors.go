@@ -124,6 +124,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		return
 	}
 	if msg != nil && msg.Error != nil {
+		SoftenCooldownRetry(backoffClientKey(c), msg.Error)
 		for _, value := range coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After") {
 			c.Writer.Header().Add("Retry-After", value)
 		}

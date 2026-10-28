@@ -688,6 +688,11 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 	if errMsg != nil {
 		errCause = errMsg.Error
 	}
+	// A model-cooldown hint can be days long and the client sleeps for all of it.
+	handlers.CapCooldownRetry(errCause)
+	if errCause != nil && strings.TrimSpace(errCause.Error()) != "" {
+		errText = errCause.Error()
+	}
 	body := handlers.BuildErrorResponseBodyWithError(status, errText, errCause)
 	payload := []byte(`{}`)
 	var errSet error

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -85,6 +86,42 @@ type modelCooldownError struct {
 	resetIn  time.Duration
 	provider string
 	cause    error
+	// advertised, when positive, is the retry hint shown to the client instead of resetIn.
+	// Clients such as Codex sleep for the full hint, so a hint of days would freeze a request
+	// long after the credentials recover. resetIn itself is never changed.
+	advertised time.Duration
+}
+
+// retryHint is the wait the client is told to observe.
+func (e *modelCooldownError) retryHint() time.Duration {
+	if e.advertised > 0 && e.advertised < e.resetIn {
+		return e.advertised
+	}
+	return e.resetIn
+}
+
+// ModelCooldownRetryIn reports the model and the true remaining cooldown of a model-level
+// cooldown error, and whether err is one.
+func ModelCooldownRetryIn(err error) (model string, resetIn time.Duration, ok bool) {
+	var cooldown *modelCooldownError
+	if errors.As(err, &cooldown) && cooldown != nil {
+		return cooldown.model, cooldown.resetIn, true
+	}
+	return "", 0, false
+}
+
+// AdvertiseModelCooldown shortens the retry hint a model-level cooldown error shows to the
+// client (Retry-After header and reset_seconds/reset_time in the body). It never lengthens the
+// hint and does not change the cooldown itself. It reports whether err is such an error.
+func AdvertiseModelCooldown(err error, hint time.Duration) bool {
+	var cooldown *modelCooldownError
+	if !errors.As(err, &cooldown) || cooldown == nil {
+		return false
+	}
+	if hint > 0 {
+		cooldown.advertised = hint
+	}
+	return true
 }
 
 // NewModelCooldownError creates an error representing model-level cooldown.
@@ -128,11 +165,12 @@ func (e *modelCooldownError) Error() string {
 	if e.provider != "" {
 		message = fmt.Sprintf("%s via provider %s", message, e.provider)
 	}
-	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
+	hint := e.retryHint()
+	resetSeconds := int(math.Ceil(hint.Seconds()))
 	if resetSeconds < 0 {
 		resetSeconds = 0
 	}
-	displayDuration := e.resetIn
+	displayDuration := hint
 	if displayDuration > 0 && displayDuration < time.Second {
 		displayDuration = time.Second
 	} else {
@@ -353,7 +391,7 @@ func (e *modelCooldownError) StatusCode() int {
 func (e *modelCooldownError) Headers() http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
-	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
+	resetSeconds := int(math.Ceil(e.retryHint().Seconds()))
 	if resetSeconds < 0 {
 		resetSeconds = 0
 	}

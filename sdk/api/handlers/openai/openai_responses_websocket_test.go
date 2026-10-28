@@ -7976,3 +7976,19 @@ func TestResponsesWebsocketReauthorizesEachTurnAndKeepsSocketOpen(t *testing.T) 
 		}
 	}
 }
+
+func TestBuildResponsesWebsocketErrorPayloadCapsModelCooldownHint(t *testing.T) {
+	payload, err := buildResponsesWebsocketErrorPayload(&interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      coreauth.NewModelCooldownError("gpt-6-astra", "codex", 430859*time.Second),
+	})
+	if err != nil {
+		t.Fatalf("buildResponsesWebsocketErrorPayload() error = %v", err)
+	}
+	if got := gjson.GetBytes(payload, "error.reset_seconds").Int(); got != 900 {
+		t.Fatalf("error.reset_seconds = %d, want the 900 s ceiling; payload %s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "status").Int(); got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", got)
+	}
+}

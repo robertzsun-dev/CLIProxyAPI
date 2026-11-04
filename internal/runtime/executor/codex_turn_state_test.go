@@ -1,8 +1,11 @@
 package executor
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"github.com/klauspost/compress/zstd"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,9 +13,9 @@ import (
 	"sync"
 	"testing"
 
+	gjson "github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	"github.com/tidwall/gjson"
 )
 
 const nativeTurnMismatchBody = `{"error":{"message":"native turn auth context mismatch: scopes","type":"internal_error","param":null,"code":null}}`
@@ -218,5 +221,68 @@ func TestDoCodexHTTPWithRecoveryLeavesOtherErrorsAlone(t *testing.T) {
 	_ = resp.Body.Close()
 	if attempts != 1 || !strings.Contains(string(body), "boom") {
 		t.Fatalf("attempts=%d body=%q", attempts, body)
+	}
+}
+
+func TestCodexRequestRecoveryPreservesCompressionFallbackAndDecoding(t *testing.T) {
+	codexTurnStates.reset()
+	t.Cleanup(codexTurnStates.reset)
+	body := []byte(`{"input":"final payload"}`)
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := encoder.EncodeAll(body, nil)
+	encoder.Close()
+	var encodings, states []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		encodings = append(encodings, r.Header.Get("Content-Encoding"))
+		states = append(states, r.Header.Get(codexTurnStateHeader))
+		if r.Header.Get("Content-Encoding") == "zstd" {
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		data, _ := io.ReadAll(r.Body)
+		if string(data) != string(body) {
+			t.Errorf("fallback changed final business payload: %s", data)
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		if r.Header.Get(codexTurnStateHeader) != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			gz := gzip.NewWriter(w)
+			_, _ = gz.Write([]byte(nativeTurnMismatchBody))
+			_ = gz.Close()
+			return
+		}
+		w.Header().Set(codexTurnStateHeader, "new-state")
+		gz := gzip.NewWriter(w)
+		_, _ = gz.Write([]byte("ok"))
+		_ = gz.Close()
+	}))
+	defer server.Close()
+	req, err := http.NewRequest(http.MethodPost, server.URL, bytes.NewReader(compressed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Encoding", "zstd")
+	req.Header.Set(codexTurnStateHeader, "old-state")
+	ready := 0
+	resp, err := doCodexRequestWithRecovery(context.Background(), server.Client(), req, "recovery-account", body, func(r *http.Request) {}, func(*http.Response) { ready++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	result, err := io.ReadAll(resp.Body)
+	if err != nil || string(result) != "ok" || resp.StatusCode != http.StatusOK {
+		t.Fatalf("response=%d %q err=%v", resp.StatusCode, result, err)
+	}
+	if len(states) != 4 || states[0] != "old-state" || states[1] != "old-state" || states[2] != "" || states[3] != "" {
+		t.Fatalf("turn-state attempts=%q", states)
+	}
+	if encodings[0] != "zstd" || encodings[1] != "" || encodings[2] != "zstd" || encodings[3] != "" || ready != 4 {
+		t.Fatalf("encodings=%q header callbacks=%d", encodings, ready)
+	}
+	if !codexTurnStates.foreign("new-state", "other-account") {
+		t.Fatal("new turn state ownership was not saved")
 	}
 }

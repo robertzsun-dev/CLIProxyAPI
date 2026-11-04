@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
+	gjson "github.com/MoeForge/moego/ojson"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 // Codex turn state (x-codex-turn-state) is an opaque sticky-routing token the
@@ -235,10 +235,22 @@ const codexSameCredentialRetryDelay = 300 * time.Millisecond
 // It also records the turn state the upstream hands out for this credential.
 // The returned response always has a readable body.
 func doCodexHTTPWithRecovery(ctx context.Context, client *http.Client, httpReq *http.Request, authID string) (*http.Response, error) {
+	return doCodexHTTPRecovery(ctx, httpReq, authID, client.Do)
+}
+
+// doCodexRequestWithRecovery retains turn-state recovery around the upstream
+// compression, response decoding, and bootstrap-clock handling.
+func doCodexRequestWithRecovery(ctx context.Context, client *http.Client, req *http.Request, authID string, upstreamBody []byte, prepareHeaders func(*http.Request), responseReady func(*http.Response)) (*http.Response, error) {
+	return doCodexHTTPRecovery(ctx, req, authID, func(attempt *http.Request) (*http.Response, error) {
+		return doCodexRequest(client, attempt, upstreamBody, prepareHeaders, responseReady)
+	})
+}
+
+func doCodexHTTPRecovery(ctx context.Context, httpReq *http.Request, authID string, send func(*http.Request) (*http.Response, error)) (*http.Response, error) {
 	authID = strings.TrimSpace(authID)
 	req := httpReq
 	for attempt := 0; ; attempt++ {
-		resp, err := client.Do(req)
+		resp, err := send(req)
 		if err != nil {
 			return resp, err
 		}

@@ -16,6 +16,10 @@ import (
 
 func TestLocalRecoveryHintsSurviveDefaultHeaderPolicyAndEnrichment(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	previousBackoff := defaultCooldownBackoff
+	defaultCooldownBackoff = newCooldownBackoff()
+	defaultCooldownBackoff.jitter = func() float64 { return 0.5 }
+	t.Cleanup(func() { defaultCooldownBackoff = previousBackoff })
 	for _, quota := range []bool{false, true} {
 		next := time.Now().Add(time.Minute)
 		_, err := (&coreauth.RoundRobinSelector{}).Pick(context.Background(), "codex", "gpt-5.6-luna", coreexecutor.Options{}, []*coreauth.Auth{{
@@ -38,7 +42,11 @@ func TestLocalRecoveryHintsSurviveDefaultHeaderPolicyAndEnrichment(t *testing.T)
 			if quota {
 				wantStatus = 429
 			}
-			if recorder.Code != wantStatus || recorder.Header().Get("Retry-After") != "60" {
+			wantRetry := "60"
+			if quota && !streaming {
+				wantRetry = "30"
+			}
+			if recorder.Code != wantStatus || recorder.Header().Get("Retry-After") != wantRetry {
 				t.Fatalf("quota=%t streaming=%t status=%d Retry-After=%q", quota, streaming, recorder.Code, recorder.Header().Get("Retry-After"))
 			}
 			if !strings.Contains(recorder.Body.String(), "gpt-5.6-luna") {

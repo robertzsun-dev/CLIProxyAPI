@@ -38,10 +38,54 @@ func TestClaudeExpiredRefreshGrantStopsRetrying(t *testing.T) {
 				t.Fatal("dead credential must be unavailable and unscheduled")
 			}
 			_, _ = manager.refreshAuthForRequest(context.Background(), a.ID, "")
+			for range 3 {
+				if _, err := manager.ForceRefreshAuth(context.Background(), a.ID); err == nil {
+					t.Fatal("forced refresh must still require a new sign-in")
+				}
+			}
 			if exec.RefreshCalls() != 1 {
 				t.Fatal("expired refresh grant was replayed")
 			}
 		})
+	}
+}
+
+func TestClaudeFreshLoginAllowsForcedRefreshAfterRejectedGrant(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	exec := &unauthorizedRefreshExecutor{id: "claude", refreshErr: errors.New(`status 400: {"error":"invalid_grant","error_description":"Refresh token expired"}`)}
+	manager.RegisterExecutor(exec)
+	a := &Auth{ID: t.Name(), Provider: "claude", Metadata: map[string]any{
+		"access_token": "expired-access", "refresh_token": "expired-grant", "expired": time.Now().Add(-time.Hour).Format(time.RFC3339),
+	}}
+	if _, err := manager.Register(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ForceRefreshAuth(ctx, a.ID); err == nil {
+		t.Fatal("expected expired grant to fail")
+	}
+	if _, err := manager.ForceRefreshAuth(ctx, a.ID); err == nil {
+		t.Fatal("expected rejected grant to require sign-in")
+	}
+	if exec.RefreshCalls() != 1 {
+		t.Fatal("rejected grant was replayed before sign-in")
+	}
+	fresh := a.Clone()
+	fresh.Metadata["access_token"] = "fresh-access"
+	fresh.Metadata["refresh_token"] = "fresh-grant"
+	fresh.Metadata["expired"] = time.Now().Add(time.Hour).Format(time.RFC3339)
+	if _, err := manager.Update(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	exec.mu.Lock()
+	exec.refreshErr = nil
+	exec.mu.Unlock()
+	current, err := manager.ForceRefreshAuth(ctx, a.ID)
+	if err != nil || current == nil || current.RequiresSignIn || current.Unavailable {
+		t.Fatalf("fresh login did not restore refresh: auth=%v error=%v", current != nil, err)
+	}
+	if exec.RefreshCalls() != 2 {
+		t.Fatal("fresh grant was not refreshed exactly once")
 	}
 }
 

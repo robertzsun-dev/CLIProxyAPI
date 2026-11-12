@@ -1290,7 +1290,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	}
 
 	// Do not repeatedly submit an unchanged refresh grant already known to be terminally rejected.
-	if !forceRefresh && authHasUnchangedRejectedRefreshToken(auth) {
+	// Claude's rejected grants cannot be repaired by forcing a dashboard refresh.
+	// A replacement login changes the grant and passes this check normally.
+	if (!forceRefresh || strings.EqualFold(strings.TrimSpace(auth.Provider), "claude")) && authHasUnchangedRejectedRefreshToken(auth) {
 		checkNow := time.Now()
 		accessTokenRejected := failedAccessToken != "" && authMatchesTokenPartition(auth, failedAccessToken)
 		if !accessTokenRejected && auth.HasValidAccessToken(checkNow) {

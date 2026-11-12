@@ -135,6 +135,25 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
+	// v8 quota reads must check the current credential before consulting cached
+	// upstream failures. Anthropic can throttle usage for an expired bearer while
+	// its profile endpoint correctly reports an authentication failure.
+	v8Usage := c.GetBool(ConfigV8ContextKey) && isUsageEndpoint(method, parsedURL) &&
+		auth != nil && authIndex != "" && usesManagedUsageToken(body.Header)
+	if v8Usage && strings.EqualFold(auth.Provider, "claude") {
+		if expiry, known := auth.AccessTokenExpirationTime(); known && !expiry.After(time.Now()) {
+			header := http.Header{}
+			if auth.RequiresSignIn {
+				header.Set("X-Quota-Auth", "sign-in-required")
+			}
+			c.JSON(http.StatusOK, apiCallResponse{
+				StatusCode: http.StatusUnauthorized,
+				Header:     header,
+				Body:       `{"error":{"type":"authentication_error","message":"OAuth access token has expired. Refresh the credential or sign in again."}}`,
+			})
+			return
+		}
+	}
 
 	perform := func() (apiCallResponse, error) {
 		resp, errCall := h.performAPICall(c.Request.Context(), body, method, urlStr, requestProxyURL, authIndex, auth)
@@ -147,7 +166,9 @@ func (h *Handler) APICall(c *gin.Context) {
 		resp    apiCallResponse
 		errCall error
 	)
-	if isUsageEndpoint(method, parsedURL) && auth != nil && authIndex != "" && strings.EqualFold(body.Header["Authorization"], "Bearer $TOKEN$") {
+	if v8Usage {
+		resp, errCall = apiCallUsageCache.fetch(managedUsageCacheKey(authIndex, urlStr, auth), perform)
+	} else if isUsageEndpoint(method, parsedURL) && auth != nil && authIndex != "" && strings.EqualFold(body.Header["Authorization"], "Bearer $TOKEN$") {
 		resp, errCall = apiCallUsageCache.fetch(authIndex+"\x00"+urlStr, perform)
 	} else {
 		resp, errCall = perform()

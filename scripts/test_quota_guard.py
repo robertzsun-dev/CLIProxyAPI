@@ -60,6 +60,26 @@ class SessionReserveTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'stale'):
                 g.upstream_get({'auth_index': 'test'}, 'https://example.com', {})
 
+    def test_rejected_refresh_grant_is_not_replayed(self):
+        for credential, headers in [
+            ({'requires_sign_in': True}, {}),
+            ({}, {'X-Quota-Auth': ['sign-in-required']}),
+            ({}, {'x-quota-auth': ['sign-in-required']}),
+        ]:
+            with self.subTest(credential=credential, headers=headers):
+                credential = {'auth_index': 'test', 'name': 'test.json', **credential}
+                with patch.object(g, 'mgmt', return_value={'status_code': 401, 'header': headers}) as mgmt:
+                    with self.assertRaisesRegex(RuntimeError, 'requires sign-in'):
+                        g.upstream_get(credential, 'https://example.com', {})
+                    self.assertEqual(mgmt.call_count, 1)
+
+    def test_refreshable_access_token_is_refreshed_once(self):
+        credential = {'auth_index': 'test', 'name': 'test.json'}
+        with patch.object(g, 'mgmt', side_effect=[{'status_code': 401}, {}, {'status_code': 200, 'body': '{"quota": 1}'}]) as mgmt:
+            self.assertEqual(g.upstream_get(credential, 'https://example.com', {}), {'quota': 1})
+            self.assertEqual(mgmt.call_args_list[1].args, ('POST', '/credentials/refresh', {'name': 'test.json'}))
+            self.assertEqual(mgmt.call_count, 3)
+
     def run_guard(self, now, *, disabled=False, guard_disabled=False, burn=False, session=40, weekly=80, failed=False):
         cred = {'name': 'coworker.json', 'email': 'coworker@example.com', 'type': 'claude',
                 'quota_owner': 'coworker', 'disabled': disabled, 'quota_burn': burn, 'priority': 101}

@@ -2375,6 +2375,14 @@ func isTerminalRefreshError(auth *Auth, err error) bool {
 	if isUnauthorizedError(err) || isTerminalRefreshGrantMessage(err.Error()) {
 		return true
 	}
+	// Claude reports expired refresh grants as invalid_grant with a prose
+	// description, rather than the refresh_token_expired code used elsewhere.
+	// Replaying the same expired grant cannot repair it. Generic invalid_grant
+	// responses retain their existing retry policy.
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") &&
+		isInvalidGrantError(err) && strings.Contains(strings.ToLower(err.Error()), "refresh token expired") {
+		return true
+	}
 	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && isInvalidGrantError(err) {
 		return true
 	}

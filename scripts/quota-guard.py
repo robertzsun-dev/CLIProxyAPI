@@ -118,6 +118,9 @@ def upstream_get(cred, url, headers):
     call = {"auth_index": cred["auth_index"], "method": "GET", "url": url, "header": headers}
     out = mgmt("POST", "/requests/api-call", call)
     if out.get("status_code") == 401:
+        response_headers = {k.lower(): v for k, v in (out.get("header") or {}).items()}
+        if cred.get("requires_sign_in") or "sign-in-required" in response_headers.get("x-quota-auth", []):
+            raise RuntimeError("credential requires sign-in")
         # api-call uses the stored token as-is; refresh it once and retry.
         mgmt("POST", "/credentials/refresh", {"name": cred["name"]})
         out = mgmt("POST", "/requests/api-call", call)

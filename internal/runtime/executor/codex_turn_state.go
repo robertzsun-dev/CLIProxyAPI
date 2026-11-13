@@ -10,6 +10,7 @@ import (
 	"time"
 
 	gjson "github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -265,7 +266,7 @@ func doCodexHTTPRecovery(ctx context.Context, httpReq *http.Request, authID stri
 		}
 		data, errRead := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewReader(data))
+		resp.Body = helps.ReplayResponseBody(data, errRead)
 		if errRead != nil {
 			return resp, nil
 		}

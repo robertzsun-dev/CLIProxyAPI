@@ -35,8 +35,9 @@ Accounts near or at a limit are re-read every run, like guests. Other accounts a
 percent or less left, BURN_FLOOR within BURN_WINDOW of the reset, or 0% within
 FINAL_WINDOW (the remainder is lost at the reset anyway), and are
 re-enabled when the window resets or when the burn window opens with quota above
-BURN_FLOOR. Claude's model-scoped weekly limits (e.g. Fable) get the same floors
-by excluding just that model family on the account.
+BURN_FLOOR. Claude's Fable-specific allowance may be used down to 0%; the
+overall weekly and work-hours session reserves still apply. Other model-scoped
+weekly limits get the same floors by excluding just that model family.
 
 Stale Codex "quota" cooldowns are cleared once fresh usage shows the account has
 quota again (the proxy keeps the 429's reset time even after an early reset).
@@ -454,7 +455,8 @@ def main():
         want = {}
         for glob, window in (st["usage"]["scoped"] or {}).items():
             rem, rst = effective(window, now)
-            if not own and not burn and rem <= floor_for(own, rst, now):
+            scoped_floor = 0 if glob == "claude-fable-*" else floor_for(own, rst, now)
+            if not own and not burn and rem <= scoped_floor:
                 want[glob] = rst
         if set(want) != set(have) and not STATUS:
             desc = "; ".join([f"exclude {g} until {when(want[g])}" for g in set(want) - set(have)] +

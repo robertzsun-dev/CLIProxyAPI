@@ -80,7 +80,7 @@ class SessionReserveTests(unittest.TestCase):
             self.assertEqual(mgmt.call_args_list[1].args, ('POST', '/credentials/refresh', {'name': 'test.json'}))
             self.assertEqual(mgmt.call_count, 3)
 
-    def run_guard(self, now, *, disabled=False, guard_disabled=False, burn=False, session=40, weekly=80, failed=False):
+    def run_guard(self, now, *, disabled=False, guard_disabled=False, burn=False, session=40, weekly=80, failed=False, scoped=None, guard_excluded=None):
         cred = {'name': 'coworker.json', 'email': 'coworker@example.com', 'type': 'claude',
                 'quota_owner': 'coworker', 'disabled': disabled, 'quota_burn': burn, 'priority': 101}
         writes = []
@@ -90,10 +90,44 @@ class SessionReserveTests(unittest.TestCase):
             writes.append((path, body))
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)/'state.json'
-            state.write_text(json.dumps({'claude:coworker@example.com': {'guard_disabled': guard_disabled}}))
-            with patch.object(g, 'STATE', str(state)), patch.object(g, 'STATUS', False), patch.object(g, 'DRY_RUN', False), patch.object(g.time, 'time', return_value=now), patch.object(g, 'mgmt', side_effect=mgmt), patch.object(g, 'claude_usage', side_effect=RuntimeError('unavailable') if failed else None, return_value=([weekly, now+86400], {}, [session, now+1000])), contextlib.redirect_stdout(io.StringIO()):
+            state.write_text(json.dumps({'claude:coworker@example.com': {'guard_disabled': guard_disabled, 'excluded': guard_excluded or {}}}))
+            with patch.object(g, 'STATE', str(state)), patch.object(g, 'STATUS', False), patch.object(g, 'DRY_RUN', False), patch.object(g.time, 'time', return_value=now), patch.object(g, 'mgmt', side_effect=mgmt), patch.object(g, 'claude_usage', side_effect=RuntimeError('unavailable') if failed else None, return_value=([weekly, now+86400], scoped or {}, [session, now+1000])), patch.object(g, 'set_guard_excludes', side_effect=lambda cred, old, new: writes.append(('exclusions', sorted(new)))), contextlib.redirect_stdout(io.StringIO()):
                 g.main()
             return writes, json.loads(state.read_text())
+
+    def test_fable_uses_remaining_allowance_and_releases_guard_exclusion(self):
+        now = at('2026-11-15T16:00:00+00:00')
+        reset = now + 86400
+        for remaining in [35, 34, 1, 0]:
+            with self.subTest(remaining=remaining):
+                writes, state = self.run_guard(now, scoped={'claude-fable-*': [remaining, reset]},
+                                               guard_excluded={'claude-fable-*': reset})
+                expected = {'claude-fable-*': reset} if remaining == 0 else {}
+                self.assertEqual(state['claude:coworker@example.com']['excluded'], expected)
+                self.assertFalse(state['claude:coworker@example.com']['guard_disabled'])
+                if remaining > 0:
+                    self.assertIn(('exclusions', []), writes)
+
+    def test_fable_does_not_bypass_shared_limits(self):
+        for date, weekly, session in [
+            ('2026-11-15T16:00:00+00:00', 35, 80),
+            ('2026-11-15T16:00:00+00:00', 20, 80),
+            ('2026-11-15T16:00:00+00:00', 0, 80),
+            ('2026-11-16T18:00:00+00:00', 80, 50),
+            ('2026-11-16T18:00:00+00:00', 80, 49),
+        ]:
+            with self.subTest(date=date, weekly=weekly, session=session):
+                now = at(date)
+                writes, state = self.run_guard(now, weekly=weekly, session=session,
+                                               scoped={'claude-fable-*': [1, now + 86400]})
+                self.assertIn(('/credentials/status', {'name': 'coworker.json', 'disabled': True}), writes)
+                self.assertTrue(state['claude:coworker@example.com']['guard_disabled'])
+
+    def test_other_model_family_keeps_weekly_reserve(self):
+        now = at('2026-11-15T16:00:00+00:00')
+        reset = now + 86400
+        _, state = self.run_guard(now, scoped={'claude-sonnet-*': [10, reset]})
+        self.assertEqual(state['claude:coworker@example.com']['excluded'], {'claude-sonnet-*': reset})
 
     def test_burn_does_not_override_reserve(self):
         writes, state = self.run_guard(at('2026-10-26T18:00:00+00:00'), burn=True)

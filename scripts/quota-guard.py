@@ -41,6 +41,9 @@ weekly limits get the same floors by excluding just that model family.
 
 Stale Codex "quota" cooldowns are cleared once fresh usage shows the account has
 quota again (the proxy keeps the 429's reset time even after an early reset).
+Claude's old, long quota holds are also cleared when a complete fresh usage
+response confirms every allowance is available. Recovery runs at most once per
+account per ten minutes and never clears short throttles or sign-in failures.
 
 Claude 404 cooldowns are cleared every run: the proxy benches a model on an
 account for 12 hours after any 404, but on Claude subscriptions a 404 is a
@@ -196,7 +199,86 @@ def claude_usage(cred):
                 scoped[f"claude-{name.lower()}-*"] = [100 - lim["percent"], epoch(lim["resets_at"])]
     if overall is None and u.get("seven_day"):
         overall = [100 - u["seven_day"]["utilization"], epoch(u["seven_day"]["resets_at"])]
-    return overall, scoped, claude_session_window(u)
+    return overall, scoped, claude_session_window(u), claude_recovery_until(u, time.time())
+
+
+def claude_recovery_until(usage, now):
+    """Earliest reset in a complete, healthy observation, or None if unproven."""
+    limits = usage.get("limits")
+    if not isinstance(limits, list) or not limits or "five_hour" not in usage:
+        return None
+    deadlines = []
+    kinds = []
+    try:
+        for limit in limits:
+            kind, used = limit.get("kind"), limit.get("percent")
+            if kind not in ("weekly_all", "weekly_scoped", "session"):
+                return None
+            if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used < 100:
+                return None
+            if kind == "weekly_scoped":
+                scope = limit.get("scope") or {}
+                if scope.get("surface") or not (scope.get("model") or {}).get("display_name"):
+                    return None
+            reset = limit.get("resets_at")
+            if reset is None and kind == "session" and used == 0:
+                kinds.append(kind)
+                continue
+            deadline = epoch(reset)
+            if deadline <= now:
+                return None
+            deadlines.append(deadline)
+            kinds.append(kind)
+        if kinds.count("weekly_all") != 1:
+            return None
+        # The legacy fields can contradict a partially updated limits list.
+        for name in ("five_hour", "seven_day"):
+            window = usage.get(name)
+            if window is None:
+                continue
+            used = window.get("utilization")
+            if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used < 100:
+                return None
+            reset = window.get("resets_at")
+            if name == "five_hour" and reset is None and used == 0:
+                continue
+            deadline = epoch(reset)
+            if deadline <= now:
+                return None
+            deadlines.append(deadline)
+    except (AttributeError, ValueError, TypeError, OverflowError):
+        return None
+    return min(deadlines)
+
+
+def claude_quota_recoverable(cred, state, now):
+    usage = state.get("usage") or {}
+    checked = usage.get("at", 0)
+    if cred.get("disabled") or cred.get("requires_sign_in"):
+        return False
+    if not 0 <= now - checked <= SESSION_MAX_AGE or (usage.get("claude_recovery_until") or 0) <= now:
+        return False
+    if now - state.get("claude_recovery_at", 0) < OWN_TTL:
+        return False
+    cooldowns = cred.get("cooldowns") or []
+    if not cooldowns:
+        return False
+    # ResetQuota clears the whole credential, so every hold must be quota-only.
+    for cooldown in cooldowns:
+        if cooldown.get("reason") not in ("quota", "credential_quota") or cooldown.get("http_status") != 429:
+            return False
+        model = cooldown.get("model_key") or ""
+        if model.startswith("claude-fable-") and "claude-fable-*" not in (usage.get("scoped") or {}):
+            return False
+        observation = (cred.get("model_quotas") or {}).get(model, {}) if model else cred.get("quota") or {}
+        try:
+            if epoch(cooldown.get("retry_at")) - now <= OWN_TTL:
+                return False
+            if checked - epoch(observation.get("observed_at")) < SESSION_MAX_AGE:
+                return False
+        except (ValueError, TypeError, OverflowError):
+            return False
+    return True
 
 
 def codex_usage(cred):
@@ -400,12 +482,15 @@ def main():
         if stale and not STATUS:
             try:
                 if kind == "claude":
-                    overall, scoped, session = claude_usage(cred)
+                    overall, scoped, session, recovery_until = claude_usage(cred)
                     credits = None
                 else:
                     overall, scoped, credits = codex_usage(cred)
                     session = None
+                    recovery_until = None
                 st["usage"] = cached = {"overall": overall, "scoped": scoped, "credits": credits, "session": session, "at": now}
+                if kind == "claude":
+                    cached["claude_recovery_until"] = recovery_until
             except Exception as err:
                 print(f"{key}: usage check failed ({err}); using last known usage")
         if not cached:
@@ -463,6 +548,13 @@ def main():
                              [f"un-exclude {g}" for g in set(have) - set(want)])
             change(f"{key}: {desc}", set_guard_excludes, cred, set(have), set(want))
         st["excluded"] = want
+
+        if ((cred.get("type") or cred.get("provider")) == "claude" and not STATUS
+                and not want_off and claude_quota_recoverable(cred, st, now)):
+            change(f"{key}: fresh quota restored; clearing obsolete long quota cooldowns",
+                   mgmt, "POST", "/routing/cooldown/reset", {"auth_index": cred["auth_index"]})
+            if not DRY_RUN:
+                st["claude_recovery_at"] = now
 
     # Priorities: tier, then soonest reset first, within each provider.
     rows = []

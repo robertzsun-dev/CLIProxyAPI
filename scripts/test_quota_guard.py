@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import datetime as dt
 import importlib.util
 import io
@@ -80,9 +81,13 @@ class SessionReserveTests(unittest.TestCase):
             self.assertEqual(mgmt.call_args_list[1].args, ('POST', '/credentials/refresh', {'name': 'test.json'}))
             self.assertEqual(mgmt.call_count, 3)
 
-    def run_guard(self, now, *, disabled=False, guard_disabled=False, burn=False, session=40, weekly=80, failed=False, scoped=None, guard_excluded=None):
+    def run_guard(self, now, *, disabled=False, guard_disabled=False, burn=False, session=40, weekly=80, failed=False, scoped=None, guard_excluded=None, recovery=False):
         cred = {'name': 'coworker.json', 'email': 'coworker@example.com', 'type': 'claude',
                 'quota_owner': 'coworker', 'disabled': disabled, 'quota_burn': burn, 'priority': 101}
+        if recovery:
+            cred.update({'auth_index': 'test', 'cooldowns': [{'reason': 'quota', 'http_status': 429,
+                         'model_key': 'claude-fable-5-2', 'retry_at': dt.datetime.fromtimestamp(now + 86400, dt.timezone.utc).isoformat()}],
+                         'model_quotas': {'claude-fable-5-2': {'observed_at': dt.datetime.fromtimestamp(now - 3600, dt.timezone.utc).isoformat()}}})
         writes = []
         def mgmt(method, path, body=None):
             if method == 'GET':
@@ -91,9 +96,25 @@ class SessionReserveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)/'state.json'
             state.write_text(json.dumps({'claude:coworker@example.com': {'guard_disabled': guard_disabled, 'excluded': guard_excluded or {}}}))
-            with patch.object(g, 'STATE', str(state)), patch.object(g, 'STATUS', False), patch.object(g, 'DRY_RUN', False), patch.object(g.time, 'time', return_value=now), patch.object(g, 'mgmt', side_effect=mgmt), patch.object(g, 'claude_usage', side_effect=RuntimeError('unavailable') if failed else None, return_value=([weekly, now+86400], scoped or {}, [session, now+1000])), patch.object(g, 'set_guard_excludes', side_effect=lambda cred, old, new: writes.append(('exclusions', sorted(new)))), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(g, 'STATE', str(state)), patch.object(g, 'STATUS', False), patch.object(g, 'DRY_RUN', False), patch.object(g.time, 'time', return_value=now), patch.object(g, 'mgmt', side_effect=mgmt), patch.object(g, 'claude_usage', side_effect=RuntimeError('unavailable') if failed else None, return_value=([weekly, now+86400], scoped or {}, [session, now+1000], now+1000 if recovery else None)), patch.object(g, 'set_guard_excludes', side_effect=lambda cred, old, new: writes.append(('exclusions', sorted(new)))), contextlib.redirect_stdout(io.StringIO()):
                 g.main()
             return writes, json.loads(state.read_text())
+
+    def test_claude_recovery_respects_reserves_and_failed_reads(self):
+        for date, weekly, session, failed, expected in [
+            ('2026-11-15T16:00:00+00:00', 80, 80, False, True),
+            ('2026-11-15T16:00:00+00:00', 35, 80, False, False),
+            ('2026-11-16T18:00:00+00:00', 80, 50, False, False),
+            ('2026-11-15T16:00:00+00:00', 80, 80, True, False),
+        ]:
+            with self.subTest(date=date, weekly=weekly, session=session, failed=failed):
+                now = at(date)
+                writes, state = self.run_guard(now, weekly=weekly, session=session, failed=failed,
+                                               scoped={'claude-fable-*': [100, now + 86400]}, recovery=True)
+                reset = ('/routing/cooldown/reset', {'auth_index': 'test'})
+                self.assertEqual(reset in writes, expected)
+                if expected:
+                    self.assertEqual(state['claude:coworker@example.com']['claude_recovery_at'], now)
 
     def test_fable_uses_remaining_allowance_and_releases_guard_exclusion(self):
         now = at('2026-11-15T16:00:00+00:00')
@@ -149,6 +170,69 @@ class SessionReserveTests(unittest.TestCase):
         self.assertIn(('/credentials/status', {'name': 'coworker.json', 'disabled': True}), writes)
         writes, _ = self.run_guard(now, disabled=True, session=100)
         self.assertEqual(writes, [])
+
+
+class ClaudeCooldownRecoveryTests(unittest.TestCase):
+    def test_complete_quota_evidence_required(self):
+        now = at('2026-11-16T04:00:00+00:00')
+        reset = '2026-11-19T13:00:00+00:00'
+        healthy = {'five_hour': None, 'limits': [
+            {'kind': 'weekly_all', 'percent': 75, 'resets_at': reset},
+            {'kind': 'weekly_scoped', 'percent': 0, 'resets_at': reset,
+             'scope': {'model': {'display_name': 'Fable'}, 'surface': None}},
+        ]}
+        self.assertEqual(g.claude_recovery_until(healthy, now), at(reset))
+        for index in [0, 1]:
+            for used in [100, 101, -1, True, '0', None, float('nan')]:
+                bad = copy.deepcopy(healthy)
+                bad['limits'][index]['percent'] = used
+                self.assertIsNone(g.claude_recovery_until(bad, now))
+        bad_payloads = [
+            {}, {**healthy, 'limits': []}, {**healthy, 'five_hour': {}},
+            {**healthy, 'five_hour': {'utilization': 100, 'resets_at': reset}},
+            {**healthy, 'seven_day': {'utilization': 100, 'resets_at': reset}},
+            {**healthy, 'limits': healthy['limits'][1:]},
+        ]
+        for value in ['2026-11-15T00:00:00+00:00', 'bad-date', None]:
+            bad = copy.deepcopy(healthy)
+            bad['limits'][0]['resets_at'] = value
+            bad_payloads.append(bad)
+        for payload in bad_payloads:
+            with self.subTest(payload=payload):
+                self.assertIsNone(g.claude_recovery_until(payload, now))
+        missing_session = copy.deepcopy(healthy)
+        del missing_session['five_hour']
+        self.assertIsNone(g.claude_recovery_until(missing_session, now))
+        healthy['five_hour'] = {'utilization': 0, 'resets_at': None}
+        self.assertEqual(g.claude_recovery_until(healthy, now), at(reset))
+
+    def test_only_old_long_quota_holds_recover_once_per_interval(self):
+        now = at('2026-11-16T04:00:00+00:00')
+        cred = {'cooldowns': [{'reason': 'quota', 'http_status': 429, 'model_key': 'claude-fable-5-2',
+                              'retry_at': '2026-11-19T13:00:00+00:00'}],
+                'model_quotas': {'claude-fable-5-2': {'observed_at': '2026-11-15T04:00:00+00:00'}}}
+        usage = {'at': now, 'claude_recovery_until': now + 86400,
+                 'scoped': {'claude-fable-*': [100, now + 86400]}}
+        state = {'usage': usage}
+        self.assertTrue(g.claude_quota_recoverable(cred, state, now))
+        for c, s in [
+            ({**cred, 'disabled': True}, state),
+            ({**cred, 'requires_sign_in': True}, state),
+            ({**cred, 'cooldowns': []}, state),
+            ({**cred, 'cooldowns': cred['cooldowns'] + [{'reason': 'unauthorized', 'http_status': 401}]}, state),
+            ({**cred, 'model_quotas': {}}, state),
+            ({**cred, 'model_quotas': {'claude-fable-5-2': {'observed_at': '2026-11-16T04:00:01+00:00'}}}, state),
+            ({**cred, 'cooldowns': [{**cred['cooldowns'][0], 'retry_at': '2026-11-16T04:01:00+00:00'}]}, state),
+            (cred, {'usage': {**usage, 'at': now - 121}}),
+            (cred, {'usage': {**usage, 'at': now + 1}}),
+            (cred, {'usage': {**usage, 'claude_recovery_until': None}}),
+            (cred, {'usage': {**usage, 'claude_recovery_until': now}}),
+            (cred, {'usage': {**usage, 'scoped': {}}}),
+            (cred, {**state, 'claude_recovery_at': now - 30}),
+        ]:
+            with self.subTest(credential=c, state=s):
+                self.assertFalse(g.claude_quota_recoverable(c, s, now))
+        self.assertTrue(g.claude_quota_recoverable(cred, {**state, 'claude_recovery_at': now - 600}, now))
 
 
 if __name__ == '__main__':

@@ -79,6 +79,7 @@ import json
 import math
 from zoneinfo import ZoneInfo
 import os
+import re
 import sys
 import tempfile
 import time
@@ -139,6 +140,11 @@ def upstream_get(cred, url, headers):
 
 
 def epoch(iso):
+    # Python 3.10 rejects Go's RFC3339Nano precision and UTC Z suffix.
+    iso = re.sub(r"\.(\d+)(?=Z?$|[+-]\d{2}:\d{2}$)",
+                 lambda match: "." + match[1][:6].ljust(6, "0"), iso)
+    if iso.endswith("Z"):
+        iso = iso[:-1] + "+00:00"
     return int(dt.datetime.fromisoformat(iso).timestamp())
 
 

@@ -86,8 +86,8 @@ class SessionReserveTests(unittest.TestCase):
                 'quota_owner': 'coworker', 'disabled': disabled, 'quota_burn': burn, 'priority': 101}
         if recovery:
             cred.update({'auth_index': 'test', 'cooldowns': [{'reason': 'quota', 'http_status': 429,
-                         'model_key': 'claude-fable-5-2', 'retry_at': dt.datetime.fromtimestamp(now + 86400, dt.timezone.utc).isoformat()}],
-                         'model_quotas': {'claude-fable-5-2': {'observed_at': dt.datetime.fromtimestamp(now - 3600, dt.timezone.utc).isoformat()}}})
+                         'model_key': 'claude-fable-5-2', 'retry_at': dt.datetime.fromtimestamp(now + 86400, dt.timezone.utc).isoformat(timespec='microseconds').replace('+00:00', '000Z')}],
+                         'model_quotas': {'claude-fable-5-2': {'observed_at': dt.datetime.fromtimestamp(now - 3600, dt.timezone.utc).isoformat(timespec='microseconds').replace('+00:00', '000+00:00')}}})
         writes = []
         def mgmt(method, path, body=None):
             if method == 'GET':
@@ -173,6 +173,21 @@ class SessionReserveTests(unittest.TestCase):
 
 
 class ClaudeCooldownRecoveryTests(unittest.TestCase):
+    def test_provider_rfc3339_timestamp_precision(self):
+        for value, expected in [
+            ('2026-11-22T13:00:15.000239759Z', '2026-11-22T13:00:15.000239+00:00'),
+            ('2026-11-15T20:26:05.232324997-08:00', '2026-11-16T04:26:05.232324+00:00'),
+            ('2026-11-22T13:00:15Z', '2026-11-22T13:00:15+00:00'),
+            ('2026-11-22T13:00:15.1Z', '2026-11-22T13:00:15.100000+00:00'),
+            ('2026-11-22T13:00:15.1234+00:00', '2026-11-22T13:00:15.123400+00:00'),
+            ('2026-11-22T13:00:15.000239+00:00', '2026-11-22T13:00:15.000239+00:00'),
+        ]:
+            with self.subTest(value=value):
+                self.assertEqual(g.epoch(value), int(at(expected)))
+        for value in ['not-a-timestamp', '2026-99-22T13:00:15Z', '2026-11-22T13:00:15.xyzZ']:
+            with self.assertRaises(ValueError):
+                g.epoch(value)
+
     def test_complete_quota_evidence_required(self):
         now = at('2026-11-16T04:00:00+00:00')
         reset = '2026-11-19T13:00:00+00:00'
@@ -209,8 +224,8 @@ class ClaudeCooldownRecoveryTests(unittest.TestCase):
     def test_only_old_long_quota_holds_recover_once_per_interval(self):
         now = at('2026-11-16T04:00:00+00:00')
         cred = {'cooldowns': [{'reason': 'quota', 'http_status': 429, 'model_key': 'claude-fable-5-2',
-                              'retry_at': '2026-11-19T13:00:00+00:00'}],
-                'model_quotas': {'claude-fable-5-2': {'observed_at': '2026-11-15T04:00:00+00:00'}}}
+                              'retry_at': '2026-11-19T13:00:00.000239759Z'}],
+                'model_quotas': {'claude-fable-5-2': {'observed_at': '2026-11-14T20:00:00.000000001-08:00'}}}
         usage = {'at': now, 'claude_recovery_until': now + 86400,
                  'scoped': {'claude-fable-*': [100, now + 86400]}}
         state = {'usage': usage}

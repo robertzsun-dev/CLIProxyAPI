@@ -6,6 +6,7 @@ Coworker Claude accounts retain 50% of their five-hour session allowance on
 weekdays from 08:00 to 18:00 America/Los_Angeles (including DST). This reserve
 also applies to burn/final tiers and the Burn switch. Missing or stale session
 usage holds the credential until fresh usage confirms it is above the floor.
+A fresh weekly-only response with an explicit null session has no session reserve.
 This polling guard stops new routed requests; it cannot reclaim usage consumed
 by requests already in flight or by the account owner outside this proxy.
 
@@ -165,7 +166,18 @@ def claude_session_window(usage):
     else:
         window = next((w for w in usage.get("limits") or [] if w.get("kind") == "session"), None)
         if window is None:
-            return None
+            # Verified Ultra accounts report an explicit null session alongside weekly limits.
+            weekly = next((w for w in usage.get("limits") or [] if w.get("kind") == "weekly_all"), None)
+            if "five_hour" not in usage or weekly is None:
+                return None
+            used = weekly.get("percent")
+            if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used <= 100:
+                return None
+            try:
+                epoch(weekly.get("resets_at"))
+            except (ValueError, TypeError):
+                return None
+            return [100, None]
         used, reset = window.get("percent"), window.get("resets_at")
     if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used <= 100:
         return None

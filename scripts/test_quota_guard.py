@@ -45,6 +45,33 @@ class SessionReserveTests(unittest.TestCase):
         self.assertIsNone(g.claude_session_window({}))
         self.assertIsNone(g.claude_session_window({'five_hour': {'utilization': 10, 'resets_at': None}}))
 
+    def test_weekly_only_accounts_have_no_session_reserve(self):
+        now = at('2026-11-17T20:00:00+00:00')
+        reset = '2026-11-24T08:00:00+00:00'
+        payload = {'five_hour': None, 'limits': [
+            {'kind': 'weekly_all', 'percent': 53, 'resets_at': reset},
+            {'kind': 'weekly_scoped', 'percent': 100, 'resets_at': reset,
+             'scope': {'model': {'display_name': 'Fable'}}},
+        ]}
+        window = g.claude_session_window(payload)
+        self.assertEqual(window, [100, None])
+        self.assertIsNone(g.session_hold('claude', False, {'session': window, 'at': now}, now))
+        self.assertIsNotNone(g.session_hold('claude', False, {'session': window, 'at': now - 121}, now))
+        for invalid in [{}, {'five_hour': None}, {'five_hour': None, 'limits': []},
+                        {'limits': payload['limits']},
+                        {**payload, 'limits': payload['limits'][1:]}]:
+            self.assertIsNone(g.claude_session_window(invalid))
+        for used in [None, True, -1, 101, '50', float('nan')]:
+            invalid = copy.deepcopy(payload)
+            invalid['limits'][0]['percent'] = used
+            self.assertIsNone(g.claude_session_window(invalid))
+        for reset_value in [None, 'bad-date']:
+            invalid = copy.deepcopy(payload)
+            invalid['limits'][0]['resets_at'] = reset_value
+            self.assertIsNone(g.claude_session_window(invalid))
+        payload['limits'].append({'kind': 'session', 'percent': 70, 'resets_at': reset})
+        self.assertEqual(g.claude_session_window(payload), [30, at(reset)])
+
     def test_floor_and_unknown_usage(self):
         now = at('2026-10-26T18:00:00+00:00')
         for remaining, held in [(51, False), (50, True), (49, True), (0, True)]:

@@ -3,7 +3,6 @@ package openai
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -190,43 +190,79 @@ func (w *responsesWebsocketWriter) writePing() error {
 }
 
 func (w *responsesWebsocketWriter) keepAlive(ctx context.Context, cancel context.CancelCauseFunc, intervals <-chan time.Duration) {
-	if errPing := runResponsesWebsocketKeepAlive(ctx, intervals, w.writePing); errPing != nil {
+	w.keepAliveWithPredicate(ctx, cancel, intervals, nil)
+}
+
+func (w *responsesWebsocketWriter) keepAliveWithPredicate(ctx context.Context, cancel context.CancelCauseFunc, intervals <-chan time.Duration, shouldPing func() bool) {
+	if errPing := runResponsesWebsocketKeepAliveWithTicker(ctx, intervals, shouldPing, w.writePing, nil); errPing != nil {
 		cancel(errPing)
 		_, _ = w.closeWithoutError()
 	}
 }
 
 func runResponsesWebsocketKeepAlive(ctx context.Context, intervals <-chan time.Duration, ping func() error) error {
-	var ticker *time.Ticker
+	return runResponsesWebsocketKeepAliveWithTicker(ctx, intervals, nil, ping, nil)
+}
+
+func runResponsesWebsocketKeepAliveWithTicker(
+	ctx context.Context,
+	intervals <-chan time.Duration,
+	shouldPing func() bool,
+	ping func() error,
+	newTicker func(time.Duration) (<-chan time.Time, func()),
+) error {
+	var stopTicker func()
 	var ticks <-chan time.Time
-	defer func() {
-		if ticker != nil {
-			ticker.Stop()
+	stopCurrent := func() {
+		if stopTicker != nil {
+			stopTicker()
+			stopTicker = nil
 		}
-	}()
+		ticks = nil
+	}
+	defer stopCurrent()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case interval := <-intervals:
 			if interval <= 0 {
-				if ticker != nil {
-					ticker.Stop()
-				}
-				ticks = nil
+				stopCurrent()
 				continue
 			}
-			if ticker == nil {
-				ticker = time.NewTicker(interval)
+			stopCurrent()
+			if newTicker != nil {
+				ticks, stopTicker = newTicker(interval)
 			} else {
-				ticker.Reset(interval)
+				ticker := time.NewTicker(interval)
+				ticks = ticker.C
+				stopTicker = ticker.Stop
 			}
-			ticks = ticker.C
 		case <-ticks:
+			if shouldPing != nil && !shouldPing() {
+				stopCurrent()
+				continue
+			}
 			if errPing := ping(); errPing != nil {
 				return errPing
 			}
 		}
+	}
+}
+
+type responsesWebsocketContinuityObserver struct {
+	setActive func(bool)
+}
+
+func (o responsesWebsocketContinuityObserver) OnContinuityWaitStart() {
+	if o.setActive != nil {
+		o.setActive(true)
+	}
+}
+
+func (o responsesWebsocketContinuityObserver) OnContinuityWaitEnd() {
+	if o.setActive != nil {
+		o.setActive(false)
 	}
 }
 
@@ -433,22 +469,49 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	c.Request = c.Request.WithContext(socketCtx)
 	upgradeRequest := c.Request.Clone(socketCtx)
 	// Start Ping at upgrade, before opening an upstream stream can block.
+	var keepAliveMu sync.Mutex
 	var keepAliveIntervals chan time.Duration
 	var keepAliveInterval time.Duration
-	updateKeepAlive := func() {
+	var keepAliveActive atomic.Bool
+	var continuityWaitCount int
+	updateKeepAliveLocked := func() {
 		if h == nil {
 			return
 		}
 		interval := handlers.StreamingKeepAliveInterval(h.CurrentConfig())
+		if interval <= 0 && continuityWaitCount > 0 {
+			interval = handlers.ContinuityKeepAliveInterval(h.CurrentConfig())
+		}
+		keepAliveActive.Store(interval > 0)
 		if interval == keepAliveInterval {
 			return
 		}
 		keepAliveInterval = interval
 		if keepAliveIntervals == nil {
 			keepAliveIntervals = make(chan time.Duration, 1)
-			go writer.keepAlive(socketCtx, cancelSocket, keepAliveIntervals)
+			go writer.keepAliveWithPredicate(socketCtx, cancelSocket, keepAliveIntervals, keepAliveActive.Load)
 		}
 		queueResponsesWebsocketKeepAliveInterval(keepAliveIntervals, interval)
+	}
+	updateKeepAlive := func() {
+		keepAliveMu.Lock()
+		defer keepAliveMu.Unlock()
+		updateKeepAliveLocked()
+	}
+	setContinuityWaitActive := func(active bool) {
+		keepAliveMu.Lock()
+		defer keepAliveMu.Unlock()
+		wasActive := continuityWaitCount > 0
+		if active {
+			continuityWaitCount++
+		} else if continuityWaitCount > 0 {
+			continuityWaitCount--
+		}
+		nowActive := continuityWaitCount > 0
+		if wasActive == nowActive {
+			return
+		}
+		updateKeepAliveLocked()
 	}
 	updateKeepAlive()
 	// The reader owns the client socket so an in-flight interrupt is not stuck
@@ -721,7 +784,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				providerKey = strings.ToLower(strings.TrimSpace(pinnedAuth.Provider))
 			}
 			state, hasState := pinnedAuthByProvider[providerKey]
-			if !ok || !hasState || state.authID != pinnedAuthID || !responsesWebsocketPinnedAuthMatchesModel(pinnedAuth, requestModelName, state.modelKey, homeRuntime) {
+			if !ok || !hasState || state.authID != pinnedAuthID || !h.responsesWebsocketPinnedAuthMatchesModel(pinnedAuth, requestModelName, state.modelKey, homeRuntime) {
 				pinnedAuthID = ""
 			}
 		}
@@ -731,7 +794,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				for providerKey := range providerSet {
 					state, ok := pinnedAuthByProvider[providerKey]
 					candidateAuth, homeRuntime, okAuth := sessionAuthByIDWithSource(state.authID)
-					if ok && okAuth && responsesWebsocketPinnedAuthMatchesModel(candidateAuth, requestModelName, state.modelKey, homeRuntime) {
+					if ok && okAuth && h.responsesWebsocketPinnedAuthMatchesModel(candidateAuth, requestModelName, state.modelKey, homeRuntime) {
 						pinnedAuthID = state.authID
 					} else {
 						delete(pinnedAuthByProvider, providerKey)
@@ -809,7 +872,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 									observedCompactionSupported = true
 									observedCompactionReplayAuthID = observedCompaction.authID
 								}
-							} else if responsesWebsocketPinnedAuthMatchesModel(compactionAuth, requestModelName, observedCompaction.modelKey, false) {
+							} else if h.responsesWebsocketPinnedAuthMatchesModel(compactionAuth, requestModelName, observedCompaction.modelKey, false) {
 								observedCompactionSupported = true
 								observedCompactionReplayAuthID = observedCompaction.authID
 							}
@@ -943,62 +1006,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 
 		modelName := strings.Clone(ojson.GetBytesNoCopy(requestJSON, "model").String())
-		lastAttemptedAuthID := pinnedAuthID
-		attemptedUpstreamMode := responsesWebsocketUpstreamModeUnknown
-		selectedAuthObserved := false
-		nativeRequest := util.IsCodexResponsesLiteRequest(payload, c.Request.Header)
-		var preserveNativeOutput atomic.Bool
-		codexDuplexStream.Store(false)
-		pinnedAuthAttempted := false
-		turnStartEpoch := inputEpoch.Load()
-		cliCtx, cliCancel := h.GetContextWithCancel(h, c, executionParent)
-		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
-		cliCtx = cliproxyexecutor.WithLocalWebsocketTurnTracker(cliCtx)
-		cliCtx = cliproxyexecutor.WithWebsocketInputEpoch(cliCtx, &inputEpoch, msgEpoch)
-		if duplexInput != nil {
-			cliCtx = cliproxyexecutor.WithWebsocketInput(cliCtx, duplexInput)
-			cliCtx = cliproxyexecutor.WithWebsocketAuthCheck(cliCtx, func(authID string) bool {
-				current, ok := sessionAuthByID(authID)
-				return ok && current != nil && !current.Disabled && current.Status != coreauth.StatusDisabled
-			})
-			boundPrincipal := usage.APIKeyFromContext(cliCtx)
-			cliCtx = cliproxyexecutor.WithWebsocketTurnAuthorizer(cliCtx, func(turnPayload []byte) ([]byte, error) {
-				principal, errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, turnPayload, modelName, false)
-				if errAuth == nil && principal != "" && principal != boundPrincipal {
-					errAuth = &interfaces.ErrorMessage{
-						StatusCode: http.StatusUnauthorized,
-						Error:      errors.New("client credential changed during the websocket stream; reconnect"),
-					}
-				}
-				if errAuth == nil {
-					return nil, nil
-				}
-				return buildResponsesWebsocketErrorPayload(errAuth)
-			})
-		}
-		if nativeWebsocketPassthrough && requestRequiresCurrentUpstreamWebsocket {
-			cliCtx = cliproxyexecutor.WithRequiredUpstreamWebsocket(cliCtx)
-		}
-		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
-		cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
-			preserveNativeOutput.Store(false)
-			codexDuplexStream.Store(false)
-			cliproxyexecutor.ResetLocalWebsocketTurn(cliCtx)
-			authID = strings.TrimSpace(authID)
-			if authID == "" || h == nil || h.AuthManager == nil {
-				return
-			}
-			lastAttemptedAuthID = authID
-			selectedAuthObserved = true
-			pinnedAuthAttempted = pinnedAuthAttempted || (pinnedAuthID != "" && authID == pinnedAuthID)
-			selectedAuth, ok := sessionAuthByID(authID)
-			if !ok || selectedAuth == nil {
-				return
-			}
-			attemptedUpstreamMode = upstreamModeForAuth(selectedAuth)
-			codexDuplexStream.Store(duplexInput != nil && attemptedUpstreamMode == responsesWebsocketUpstreamModeWS && strings.EqualFold(strings.TrimSpace(selectedAuth.Provider), "codex"))
-			preserveNativeOutput.Store(nativeRequest && strings.EqualFold(strings.TrimSpace(selectedAuth.Provider), "codex"))
-		})
 		executionAuthID := ""
 		if !routeOverridesModelResolution {
 			executionAuthID = pinnedAuthID
@@ -1006,131 +1013,274 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		if executionAuthID == "" {
 			executionAuthID = observedCompactionReplayAuthID
 		}
-		if executionAuthID != "" && !isPluginExecutorRoute {
-			cliCtx = handlers.WithPinnedAuthID(cliCtx, executionAuthID)
-		}
-		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
-		if !selectedAuthObserved {
-			// Plugin/alternate routes bypass auth selection. Keep canonical HTTP-mode
-			// state instead of inheriting the previous pinned websocket mode.
-			attemptedUpstreamMode = responsesWebsocketUpstreamModeHTTP
-		}
-		// A connection-scoped continuation cannot rotate credentials in place. Suppress
-		// credential errors and make the client replay the full turn on a new socket
-		// when another eligible target can serve the replayed turn.
-		var lossWriteErr error
-		var replayedPinnedAuthFailure bool
-		replayPinnedAuthFailure := func(errMsg *interfaces.ErrorMessage) bool {
-			if cliproxyexecutor.IsUpstreamWebsocketTurnError(errMsg.Error) {
-				// The upstream websocket was lost: tell the client, keep its socket open, and
-				// fence the input it sent before the loss. A refused continuation is not a loss.
-				var turnErr *cliproxyexecutor.UpstreamWebsocketTurnError
-				if errors.As(errMsg.Error, &turnErr) {
-					if (turnErr.FullContextRequired || turnErr.NotSent || !codexDuplexStream.Load()) &&
-						turnErr.EventID == "" && !turnErr.Idle && len(turnErr.Abandoned) == 0 {
-						turnErr.EventID = strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(payload, "event_id").String()))
-					}
-					if !turnErr.FullContextRequired && !turnErr.NotSent && inputEpoch.Load() == turnStartEpoch {
-						inputEpoch.Add(1)
-					}
-				}
-				lossWriteErr = writeResponsesWebsocketUpstreamLoss(writer, wsTimelineLog, errMsg)
-				return true
-			}
-			if !nativeWebsocketPassthrough || !requestRequiresCurrentUpstreamWebsocket || !pinnedAuthAttempted ||
-				!shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg) {
-				return false
-			}
-			if (responsesWebsocketErrorStatus(errMsg) == http.StatusTooManyRequests || isResponsesWebsocketQuotaOrCooldownError(errMsg.Error)) &&
-				!h.responsesWebsocketHasAlternativeReplayTarget(cliCtx, modelName, requestJSON, lastAttemptedAuthID) {
-				return false
-			}
-			replayedPinnedAuthFailure = true
-			return true
-		}
 
-		completedOutput, completedResponseID, completedPendingToolCallIDs, forwardErrMsg, errForward := h.forwardResponsesWebsocket(
-			c,
-			writer,
-			cliCancel,
-			dataChan,
-			errChan,
-			wsTimelineLog,
-			passthroughSessionID,
-			responsesWebsocketForwardOptions{
-				preserveCompletionOutput: preserveNativeOutput.Load,
-				duplexStream: func() bool {
-					return codexDuplexStream.Load() && !cliproxyexecutor.LocalWebsocketTurnExecuted(cliCtx)
-				},
-				toolCacheTurn:  toolCacheTurn,
-				suppressError:  replayPinnedAuthFailure,
-				localInterrupt: localInterrupt,
-				quotaFallback:  quotaFallback,
-				websocketOwned: func() bool {
-					return attemptedUpstreamMode == responsesWebsocketUpstreamModeWS && !cliproxyexecutor.LocalWebsocketTurnExecuted(cliCtx)
-				},
-			},
-		)
-		if errForward != nil {
-			wsTerminateErr = errForward
-			switch {
-			case errors.Is(errForward, websocket.ErrCloseSent):
-			case isWebsocketConnectionClosedError(errForward):
-				// The client hung up while a downstream write was in flight. This is a
-				// normal shutdown race, not a proxy failure.
-				log.Debugf("responses websocket: client closed during forward id=%s error=%v", passthroughSessionID, errForward)
-			default:
-				log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
+		var excludedAuthIDs []string
+		retriedPinnedFailover := false
+		var lastAttemptedAuthID string
+		var attemptedUpstreamMode string
+		var selectedAuthObserved bool
+		var preserveNativeOutput atomic.Bool
+		var pinnedAuthAttempted bool
+		var cliCtx context.Context
+		var completedOutput []byte
+		var completedResponseID string
+		var completedPendingToolCallIDs []string
+		var forwardErrMsg *interfaces.ErrorMessage
+
+		turnExecutionParent := coreauth.WithFreshRequestContinuitySession(executionParent)
+		for {
+			lastAttemptedAuthID = pinnedAuthID
+			attemptedUpstreamMode = responsesWebsocketUpstreamModeUnknown
+			selectedAuthObserved = false
+			nativeRequest := util.IsCodexResponsesLiteRequest(payload, c.Request.Header)
+			preserveNativeOutput.Store(false)
+			codexDuplexStream.Store(false)
+			pinnedAuthAttempted = false
+			turnStartEpoch := inputEpoch.Load()
+			var cliCancel handlers.APIHandlerCancelFunc
+			cliCtx, cliCancel = h.GetContextWithCancel(h, c, turnExecutionParent)
+			cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
+			if !nativeWebsocketPassthrough && !ojson.GetBytesNoCopy(payload, "instructions").Exists() {
+				if inherited := ojson.GetBytesNoCopy(requestJSON, "instructions"); inherited.Exists() {
+					cliCtx = cliproxyexecutor.WithInheritedWebsocketInstructions(cliCtx, strings.Clone(inherited.Raw))
+				}
 			}
-			return
-		}
-		if forwardErrMsg != nil && cliproxyexecutor.IsUpstreamWebsocketTurnError(forwardErrMsg.Error) {
-			if lossWriteErr != nil {
-				wsTerminateErr = lossWriteErr
-				return
+			cliCtx = cliproxyexecutor.WithLocalWebsocketTurnTracker(cliCtx)
+			cliCtx = cliproxyexecutor.WithWebsocketInputEpoch(cliCtx, &inputEpoch, msgEpoch)
+			if duplexInput != nil {
+				cliCtx = cliproxyexecutor.WithWebsocketInput(cliCtx, duplexInput)
+				cliCtx = cliproxyexecutor.WithWebsocketAuthCheck(cliCtx, func(authID string) bool {
+					current, ok := sessionAuthByID(authID)
+					return ok && current != nil && !current.Disabled && current.Status != coreauth.StatusDisabled
+				})
+				boundPrincipal := usage.APIKeyFromContext(cliCtx)
+				cliCtx = cliproxyexecutor.WithWebsocketTurnAuthorizer(cliCtx, func(turnPayload []byte) ([]byte, error) {
+					principal, errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, turnPayload, modelName, false)
+					if errAuth == nil && principal != "" && principal != boundPrincipal {
+						errAuth = &interfaces.ErrorMessage{
+							StatusCode: http.StatusUnauthorized,
+							Error:      errors.New("client credential changed during the websocket stream; reconnect"),
+						}
+					}
+					if errAuth == nil {
+						return nil, nil
+					}
+					return buildResponsesWebsocketErrorPayload(errAuth)
+				})
 			}
-			// Keep the credential: the next full create reconnects on it, never on another one.
-			if (attemptedUpstreamMode == responsesWebsocketUpstreamModeWS || upstreamMode == responsesWebsocketUpstreamModeWS) && lastAttemptedAuthID != "" {
-				upstreamMode = responsesWebsocketUpstreamModeWS
-				upstreamWebsocketAuthID = lastAttemptedAuthID
-				rememberPinnedAuth(lastAttemptedAuthID, modelName)
-				passthroughModelName = modelName
+			if nativeWebsocketPassthrough && requestRequiresCurrentUpstreamWebsocket {
+				cliCtx = cliproxyexecutor.WithRequiredUpstreamWebsocket(cliCtx)
 			}
-			continue
-		}
-		if forwardErrMsg != nil {
-			if failover, ok := cliproxyexecutor.AsWebsocketCredentialFailover(forwardErrMsg.Error); ok {
-				// The bound credential ran out of quota before answering. It is cooling
-				// now, so the next execution selects another account on a fresh upstream
-				// socket. Conversation state does not move between accounts.
-				forgetPinnedAuth()
-				upstreamMode = responsesWebsocketUpstreamModeUnknown
-				upstreamWebsocketAuthID = ""
-				frames, errWrite := h.replayResponsesWebsocketAfterCredentialFailover(c, writer, wsTimelineLog, passthroughSessionID, lastAttemptedAuthID, failover)
-				if errWrite != nil {
-					wsTerminateErr = errWrite
+			cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
+			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
+				preserveNativeOutput.Store(false)
+				codexDuplexStream.Store(false)
+				cliproxyexecutor.ResetLocalWebsocketTurn(cliCtx)
+				authID = strings.TrimSpace(authID)
+				if authID == "" || h == nil || h.AuthManager == nil {
 					return
 				}
-				if len(frames) > 0 && len(frames) == len(failover.Frames) {
-					replayQuotaFallback = failover.ErrorPayload
+				lastAttemptedAuthID = authID
+				selectedAuthObserved = true
+				pinnedAuthAttempted = pinnedAuthAttempted || (pinnedAuthID != "" && authID == pinnedAuthID)
+				selectedAuth, ok := sessionAuthByID(authID)
+				if !ok || selectedAuth == nil {
+					return
 				}
-				replayFrames = append(frames, replayFrames...)
-				continue
+				attemptedUpstreamMode = upstreamModeForAuth(selectedAuth)
+				codexDuplexStream.Store(duplexInput != nil && attemptedUpstreamMode == responsesWebsocketUpstreamModeWS && strings.EqualFold(strings.TrimSpace(selectedAuth.Provider), "codex"))
+				preserveNativeOutput.Store(nativeRequest && strings.EqualFold(strings.TrimSpace(selectedAuth.Provider), "codex"))
+			})
+			if executionAuthID != "" && !isPluginExecutorRoute {
+				cliCtx = handlers.WithPinnedAuthID(cliCtx, executionAuthID)
 			}
-			if pinnedAuthAttempted && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
-				forgetPinnedAuth()
+			if len(excludedAuthIDs) > 0 {
+				cliCtx = handlers.WithExcludedAuthIDs(cliCtx, excludedAuthIDs)
 			}
-			if replayedPinnedAuthFailure {
-				replayErr := responsesWebsocketHTTPReplayRequiredError()
-				wsTerminateErr = replayErr
-				matched, errClose := writer.closeForUpstreamError(replayErr)
-				if !matched {
-					_ = conn.Close()
-				} else if errClose != nil && !errors.Is(errClose, websocket.ErrCloseSent) {
-					log.Debugf("responses websocket: credential replay close failed id=%s error=%v", passthroughSessionID, errClose)
+			var dataChan <-chan []byte
+			var errChan <-chan *interfaces.ErrorMessage
+			if h != nil && h.HasSchedulerContinuity() {
+				cliCtx = cliproxyexecutor.WithContinuityWaitObserver(cliCtx, responsesWebsocketContinuityObserver{setActive: setContinuityWaitActive})
+				dataChan, _, errChan = h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
+			} else {
+				dataChan, _, errChan = h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
+			}
+			if !selectedAuthObserved {
+				// Plugin/alternate routes bypass auth selection. Keep canonical HTTP-mode
+				// state instead of inheriting the previous pinned websocket mode.
+				attemptedUpstreamMode = responsesWebsocketUpstreamModeHTTP
+			}
+			// A connection-scoped continuation cannot rotate credentials in place. Suppress
+			// credential errors and make the client replay the full turn on a new socket
+			// when another eligible target can serve the replayed turn. For a self-contained
+			// full response.create that fails before committing any downstream output, unpin
+			// and fail over in place on the existing downstream socket.
+			var lossWriteErr error
+			var replayedPinnedAuthFailure bool
+			var failoverInPlace bool
+			var downstreamCommitted atomic.Bool
+			replayPinnedAuthFailure := func(errMsg *interfaces.ErrorMessage) bool {
+				if cliproxyexecutor.IsUpstreamWebsocketTurnError(errMsg.Error) {
+					// The upstream websocket was lost: tell the client, keep its socket open, and
+					// fence the input it sent before the loss. A refused continuation is not a loss.
+					var turnErr *cliproxyexecutor.UpstreamWebsocketTurnError
+					if errors.As(errMsg.Error, &turnErr) {
+						if (turnErr.FullContextRequired || turnErr.NotSent || !codexDuplexStream.Load()) &&
+							turnErr.EventID == "" && !turnErr.Idle && len(turnErr.Abandoned) == 0 {
+							turnErr.EventID = strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(payload, "event_id").String()))
+						}
+						if !turnErr.FullContextRequired && !turnErr.NotSent && inputEpoch.Load() == turnStartEpoch {
+							inputEpoch.Add(1)
+						}
+					}
+					lossWriteErr = writeResponsesWebsocketUpstreamLoss(writer, wsTimelineLog, errMsg)
+					return true
+				}
+				if coreauth.IsContinuityTerminatedError(errMsg.Error) {
+					return false
+				}
+				if !nativeWebsocketPassthrough || !pinnedAuthAttempted {
+					return false
+				}
+				if !shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg) &&
+					!isResponsesWebsocketQuotaOrCooldownError(errMsg.Error) {
+					return false
+				}
+				if !requestRequiresCurrentUpstreamWebsocket {
+					if retriedPinnedFailover || downstreamCommitted.Load() {
+						return false
+					}
+					if h != nil && h.AuthManager != nil && errMsg != nil && errMsg.Error != nil {
+						proceed, gateErr := h.AuthManager.EvaluatePreOutputStreamFailoverQuotaGate(cliCtx, modelName, lastAttemptedAuthID, errMsg.Error)
+						if !proceed {
+							if gateErr != nil {
+								errMsg.Error = gateErr
+							}
+							return false
+						}
+					}
+					if !h.responsesWebsocketHasAlternativeReplayTarget(cliCtx, modelName, requestJSON, lastAttemptedAuthID) {
+						return false
+					}
+					failoverInPlace = true
+					return true
+				}
+				if (responsesWebsocketErrorStatus(errMsg) == http.StatusTooManyRequests || isResponsesWebsocketQuotaOrCooldownError(errMsg.Error)) &&
+					!h.responsesWebsocketHasAlternativeReplayTarget(cliCtx, modelName, requestJSON, lastAttemptedAuthID) {
+					return false
+				}
+				replayedPinnedAuthFailure = true
+				return true
+			}
+
+			var errForward error
+			completedOutput, completedResponseID, completedPendingToolCallIDs, forwardErrMsg, errForward = h.forwardResponsesWebsocket(
+				c,
+				writer,
+				cliCancel,
+				dataChan,
+				errChan,
+				wsTimelineLog,
+				passthroughSessionID,
+				responsesWebsocketForwardOptions{
+					preserveCompletionOutput: preserveNativeOutput.Load,
+					duplexStream: func() bool {
+						return codexDuplexStream.Load() && !cliproxyexecutor.LocalWebsocketTurnExecuted(cliCtx)
+					},
+					quotaFallback:      quotaFallback,
+					toolCacheTurn:      toolCacheTurn,
+					suppressError:      replayPinnedAuthFailure,
+					onDownstreamCommit: func() { downstreamCommitted.Store(true) },
+					localInterrupt:     localInterrupt,
+					websocketOwned: func() bool {
+						return attemptedUpstreamMode == responsesWebsocketUpstreamModeWS && !cliproxyexecutor.LocalWebsocketTurnExecuted(cliCtx)
+					},
+				},
+			)
+			cliCancel(nil)
+			if errForward != nil {
+				wsTerminateErr = errForward
+				switch {
+				case errors.Is(errForward, websocket.ErrCloseSent):
+				case isWebsocketConnectionClosedError(errForward):
+					// The client hung up while a downstream write was in flight. This is a
+					// normal shutdown race, not a proxy failure.
+					log.Debugf("responses websocket: client closed during forward id=%s error=%v", passthroughSessionID, errForward)
+				default:
+					log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
 				}
 				return
 			}
+			if forwardErrMsg != nil && cliproxyexecutor.IsUpstreamWebsocketTurnError(forwardErrMsg.Error) {
+				if lossWriteErr != nil {
+					wsTerminateErr = lossWriteErr
+					return
+				}
+				// Keep the credential: the next full create reconnects on it, never on another one.
+				if (attemptedUpstreamMode == responsesWebsocketUpstreamModeWS || upstreamMode == responsesWebsocketUpstreamModeWS) && lastAttemptedAuthID != "" {
+					upstreamMode = responsesWebsocketUpstreamModeWS
+					upstreamWebsocketAuthID = lastAttemptedAuthID
+					rememberPinnedAuth(lastAttemptedAuthID, modelName)
+					passthroughModelName = modelName
+				}
+				break
+			}
+			if forwardErrMsg != nil {
+				if failover, ok := cliproxyexecutor.AsWebsocketCredentialFailover(forwardErrMsg.Error); ok {
+					// The bound credential ran out of quota before answering. It is cooling
+					// now, so the next execution selects another account on a fresh upstream
+					// socket. Conversation state does not move between accounts.
+					forgetPinnedAuth()
+					upstreamMode = responsesWebsocketUpstreamModeUnknown
+					upstreamWebsocketAuthID = ""
+					frames, errWrite := h.replayResponsesWebsocketAfterCredentialFailover(c, writer, wsTimelineLog, passthroughSessionID, lastAttemptedAuthID, failover)
+					if errWrite != nil {
+						wsTerminateErr = errWrite
+						return
+					}
+					if len(frames) > 0 && len(frames) == len(failover.Frames) {
+						replayQuotaFallback = failover.ErrorPayload
+					}
+					replayFrames = append(frames, replayFrames...)
+					break
+				}
+				if failoverInPlace {
+					retriedPinnedFailover = true
+					if lastAttemptedAuthID != "" {
+						excludedAuthIDs = append(excludedAuthIDs, lastAttemptedAuthID)
+					}
+					forgetPinnedAuth()
+					upstreamWebsocketAuthID = ""
+					upstreamMode = responsesWebsocketUpstreamModeUnknown
+					observedCompactionReplayAuthID = ""
+					executionAuthID = ""
+					nativeWebsocketPassthrough = false
+					failoverDoc := ojson.NewDoc(requestJSON)
+					_ = failoverDoc.Delete("type")
+					requestJSON = failoverDoc.Bytes()
+					requestJSON, toolCacheTurn = prepareResponsesWebsocketFallbackTurn(downstreamSessionKey, requestJSON)
+					nextLastRequest = requestJSON
+					continue
+				}
+				if pinnedAuthAttempted && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
+					forgetPinnedAuth()
+				}
+				if replayedPinnedAuthFailure {
+					replayErr := responsesWebsocketHTTPReplayRequiredError()
+					wsTerminateErr = replayErr
+					matched, errClose := writer.closeForUpstreamError(replayErr)
+					if !matched {
+						_ = conn.Close()
+					} else if errClose != nil && !errors.Is(errClose, websocket.ErrCloseSent) {
+						log.Debugf("responses websocket: credential replay close failed id=%s error=%v", passthroughSessionID, errClose)
+					}
+					return
+				}
+				break
+			}
+			break
+		}
+		if forwardErrMsg != nil {
 			continue
 		}
 

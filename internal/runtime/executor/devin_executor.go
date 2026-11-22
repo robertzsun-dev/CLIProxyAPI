@@ -3,10 +3,8 @@ package executor
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/MoeForge/moego/base64"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +13,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/json"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
@@ -449,7 +450,8 @@ func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *clipr
 	payload := req.Payload
 	isInteractionsSource := opts.SourceFormat == "" || opts.SourceFormat == sdktranslator.FormatInteractions
 	if !isInteractionsSource {
-		translated := sdktranslator.TranslateRequestEnvelope(ctx, opts.SourceFormat, sdktranslator.FormatInteractions, sdktranslator.RequestEnvelope{
+		translateCtx := context.WithValue(ctx, translatorcommon.DevinReasoningReplayKey{}, true)
+		translated := sdktranslator.TranslateRequestEnvelope(translateCtx, opts.SourceFormat, sdktranslator.FormatInteractions, sdktranslator.RequestEnvelope{
 			Format: opts.SourceFormat,
 			Model:  req.Model,
 			Stream: opts.Stream,
@@ -1218,9 +1220,20 @@ func (e *DevinExecutor) streamDevinFramesForAuth(
 			}
 		}
 
-		// Emit thinking signature delta targeting the thought step
-		if len(frameRes.DeltaSignature) > 0 {
-			if thoughtStepIndex == -1 && !contentStarted {
+		// Responses may receive the signature type in a separate frame.
+		lateType := responseFormat == sdktranslator.FormatOpenAIResponse && frameRes.DeltaSignatureType != "" && thoughtStepIndex >= 0 && responseThoughtSignatures[thoughtStepIndex] != ""
+		if len(frameRes.DeltaSignature) > 0 || lateType {
+			if thoughtStepIndex == -1 && (!contentStarted || responseFormat == sdktranslator.FormatOpenAIResponse) {
+				// A signature-only thought can follow an already-open message.
+				if contentStarted {
+					stopDoc := ojson.NewDocString(`{"event_type":"step.stop"}`)
+					_ = stopDoc.Set("index", stepIndex)
+					if !emitInteractionsEvent(stopDoc.Bytes()) {
+						return
+					}
+					contentStarted = false
+					stepIndex++
+				}
 				thoughtStepIndex = stepIndex
 				startEvent, _ := ojson.SetBytes([]byte(`{"event_type":"step.start","index":0,"step":{"type":"thought"}}`), "index", stepIndex)
 				if !emitInteractionsEvent(startEvent) {
@@ -1235,14 +1248,16 @@ func (e *DevinExecutor) streamDevinFramesForAuth(
 			sigDoc := ojson.NewDoc([]byte(`{"event_type":"step.delta","index":0,"delta":{"type":"thought_signature","signature":""}}`))
 			_ = sigDoc.Set("index", targetIdx)
 			sig := string(frameRes.DeltaSignature)
+			sigType := frameRes.DeltaSignatureType
 			if responseFormat == sdktranslator.FormatOpenAIResponse {
 				// The Responses translator accepts complete signatures, not fragments.
 				responseThoughtSignatures[targetIdx] += sig
 				sig = responseThoughtSignatures[targetIdx]
+				sigType = signatureType
 			}
 			_ = sigDoc.Set("delta.signature", sig)
-			if frameRes.DeltaSignatureType != "" {
-				_ = sigDoc.Set("delta.signature_type", frameRes.DeltaSignatureType)
+			if sigType != "" {
+				_ = sigDoc.Set("delta.signature_type", sigType)
 			}
 			if !emitInteractionsEvent(sigDoc.Bytes()) {
 				return
@@ -1828,6 +1843,9 @@ func consumeDevinFramesToInteractionsForAuth(body io.Reader, model, chatModelUID
 			sigStr := string(accumulatedSignature)
 			_ = thoughtDoc.Set("signature", sigStr)
 			_ = thoughtDoc.Set("thought_signature", sigStr)
+			if signatureType != "" {
+				_ = thoughtDoc.Set("signature_type", signatureType)
+			}
 		}
 		steps = append(steps, thoughtDoc.Bytes())
 	}
@@ -2040,8 +2058,15 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 				// If previous prompt was assistant, attach thinking; otherwise append assistant prompt
 				text := extractInteractionsStepText(step)
 				sigStr := firstNonEmpty(step.Get("signature").String(), step.Get("thought_signature").String())
-				sigBytes, sigType := parseSignatureBytes(sigStr)
-				if len(prompts) > 0 && prompts[len(prompts)-1].Source == 2 {
+				var sigBytes []byte
+				var sigType string
+				openAI := step.Get("signature_type").String() == "openai" && internalsignature.IsDevinOpenAIReasoningSignature(sigStr)
+				if openAI {
+					sigBytes, sigType = []byte(sigStr), "openai"
+				} else {
+					sigBytes, sigType = parseSignatureBytes(sigStr)
+				}
+				if len(prompts) > 0 && prompts[len(prompts)-1].Source == 2 && !(openAI && len(prompts[len(prompts)-1].Signature) > 0) {
 					if prompts[len(prompts)-1].Thinking != "" {
 						prompts[len(prompts)-1].Thinking += "\n\n" + text
 					} else {
@@ -2910,16 +2935,24 @@ func (e *DevinExecutor) getSensitiveWordsReplace() map[string]string {
 	return nil
 }
 
+func (e *DevinExecutor) getSensitivePatternsReplace() []config.SensitivePatternRule {
+	if e != nil && e.cfg != nil && len(e.cfg.Devin.SensitivePatternsReplace) > 0 {
+		return e.cfg.Devin.SensitivePatternsReplace
+	}
+	return nil
+}
+
 func (e *DevinExecutor) getSensitiveWordMatcher() *helps.SensitiveWordMatcher {
 	if e == nil {
 		return nil
 	}
 	words := e.getSensitiveWords()
 	replacements := e.getSensitiveWordsReplace()
-	if len(words) == 0 && len(replacements) == 0 {
+	patterns := e.getSensitivePatternsReplace()
+	if len(words) == 0 && len(replacements) == 0 && len(patterns) == 0 {
 		return nil
 	}
-	key := helps.SensitiveWordConfigCacheKey(words, replacements)
+	key := helps.SensitiveWordConfigCacheKeyWithPatterns(words, replacements, patterns)
 	e.matcherMu.RLock()
 	if e.lastWordsKey == key {
 		m := e.cachedMatcher
@@ -2934,7 +2967,7 @@ func (e *DevinExecutor) getSensitiveWordMatcher() *helps.SensitiveWordMatcher {
 		return e.cachedMatcher
 	}
 	e.lastWordsKey = key
-	e.cachedMatcher = helps.BuildSensitiveWordMatcherWithReplacements(words, replacements)
+	e.cachedMatcher = helps.BuildSensitiveWordMatcherWithPatterns(words, replacements, patterns)
 	return e.cachedMatcher
 }
 

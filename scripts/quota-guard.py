@@ -21,7 +21,11 @@ guard rewrites priorities every run (larger is used first):
   own tier    Robert's accounts ("personal" owner, see below)
   guest tier  everyone else's accounts
 
-Inside a tier, the account that resets soonest ranks highest. Robert's accounts
+Within the ordinary Claude personal and guest tiers, spend weekly quota first on
+accounts with the least Fable left relative to their spendable weekly allowance.
+Accounts with an empty Fable window can still serve other models. The percentages
+are a routing heuristic, not a conversion between the two upstream quotas.
+Ties and the other tiers use the soonest weekly reset first. Robert's accounts
 have no floor; once one is exhausted it drops to priority 1 so it stops being
 tried first.
 
@@ -82,7 +86,6 @@ from zoneinfo import ZoneInfo
 import os
 import re
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -93,6 +96,7 @@ OWN = {"robert@dexterity.ai", "robert.sun@dexterity.ai", "robert.sun@dex.ai"}
 FLOOR = 35          # percent of the weekly limit left untouched for the account's owner
 BURN_FLOOR = 5      # floor once the weekly reset is within BURN_WINDOW
 BURN_WINDOW = 5 * 3600
+FABLE = "claude-fable-*"
 FINAL_WINDOW = 3600  # within this of the reset, guests may be used to 0%
 OWN_CODEX = {"minsoo.kim@dexterity.ai", "mark.dutka@dexterity.ai"}  # robert 2026-10-09/10: treat as his own for Codex (no floor)
 OWN_TTL, GUEST_TTL = 600, 110  # usage cache lifetimes; guests are checked every run
@@ -380,19 +384,31 @@ def burning(cred, key, reset, now):
     return False
 
 
+def fable_share(usage, spendable_weekly, now):
+    """Lower ratios spend shared quota first, protecting accounts with scarce weekly headroom."""
+    window = (usage.get("scoped") or {}).get(FABLE)
+    if not window or now >= window[1] or spendable_weekly <= 0:
+        return math.inf
+    return window[0] / spendable_weekly
+
+
 def set_guard_excludes(cred, old, new):
-    path = os.path.join(AUTH_DIR, cred["name"])
-    with open(path) as f:
+    with open(cred.get("path") or os.path.join(AUTH_DIR, cred["name"])) as f:
         data = json.load(f)
-    keep = [m for m in data.get("excluded_models") or [] if m not in old]
-    data["excluded_models"] = keep + sorted(new)
-    if not data["excluded_models"]:
-        del data["excluded_models"]
-    fd, tmp = tempfile.mkstemp(dir=AUTH_DIR, prefix=".guard-")
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    current = data.get("excluded_models", data.get("excluded-models")) or []
+    # Old installs recorded ownership only in the guard state. Persist it with
+    # the rules so retries can distinguish our additions from manual exclusions.
+    marker = "quota_guard_excluded_models"
+    owned = set(data.get(marker, old))
+    manual = [rule for rule in current if rule not in owned]
+    needed = new.difference(manual)
+    rules = manual + sorted(needed)
+    if rules == current and (data.get(marker) == sorted(needed) or not (owned or needed)):
+        return needed
+    change(f"{cred['name']}: update quota guard exclusions to {sorted(needed)}",
+           mgmt, "PATCH", "/credentials/fields",
+           {"name": cred["name"], "excluded_models": rules, marker: sorted(needed)})
+    return needed
 
 
 def meta_tier(cred):
@@ -489,11 +505,14 @@ def main():
         last = (cached or {}).get("credits") or {}
         near = last.get("reached") or last.get("near")
         ttl = OWN_TTL if own and not near else GUEST_TTL
+        if kind == "claude" and FABLE in ((cached or {}).get("scoped") or {}):
+            ttl = GUEST_TTL
         if kind == "claude" and not own and work_hours(now):
             ttl = 30  # The proxy coalesces upstream usage reads in its shared cache.
         stale = (not cached or now - cached["at"] > ttl or (cached["overall"] and now >= cached["overall"][1])
                  or (kind == "codex" and "credits" not in cached)
                  or (kind == "claude" and ("session" not in cached or
+                     any(now >= w[1] for w in (cached.get("scoped") or {}).values()) or
                      (cached.get("session") and cached["session"][1] is not None and now >= cached["session"][1]))))
         # Recheck guard-disabled accounts too: their five-hour window can reset
         # before the weekly window. upstream_get refreshes expired tokens once.
@@ -558,13 +577,12 @@ def main():
         want = {}
         for glob, window in (st["usage"]["scoped"] or {}).items():
             rem, rst = effective(window, now)
-            scoped_floor = 0 if glob == "claude-fable-*" else floor_for(own, rst, now)
-            if not own and not burn and rem <= scoped_floor:
+            if (glob == FABLE and rem <= 0) or (
+                    not own and not burn and glob != FABLE and rem <= floor_for(own, rst, now)):
                 want[glob] = rst
-        if set(want) != set(have) and not STATUS:
-            desc = "; ".join([f"exclude {g} until {when(want[g])}" for g in set(want) - set(have)] +
-                             [f"un-exclude {g}" for g in set(have) - set(want)])
-            change(f"{key}: {desc}", set_guard_excludes, cred, set(have), set(want))
+        if not STATUS and (cred.get("type") or cred.get("provider")) == "claude" and not cred.get("runtime_only"):
+            owned = set_guard_excludes(cred, set(have), set(want))
+            want = {rule: want[rule] for rule in owned}
         st["excluded"] = want
 
         if ((cred.get("type") or cred.get("provider")) == "claude" and not STATUS
@@ -595,13 +613,16 @@ def main():
             else:
                 tier = "own" if own else "guest"
             cred["_balance"] = (st["usage"].get("credits") or {}).get("balance", 0.0)
-            tiers.setdefault(tier, []).append((reset if reset is not None else float("inf"), -remaining, key, cred, remaining, reset, own))
+            share = 0
+            if kind == "claude" and tier in ("own", "guest"):
+                share = fable_share(st["usage"], remaining - floor_for(own, reset, now), now)
+            tiers.setdefault(tier, []).append((share, reset if reset is not None else float("inf"), -remaining, key, cred, remaining, reset, own))
         for tier, members in tiers.items():
             if tier == "credits":  # Robert's first, then the largest balance
-                members.sort(key=lambda m: (not m[6], -m[3]["_balance"]))
+                members.sort(key=lambda m: (not m[7], -m[4]["_balance"]))
             else:
                 members.sort()
-            for rank, (_, _, key, cred, remaining, reset, own) in enumerate(members):
+            for rank, (_, _, _, key, cred, remaining, reset, own) in enumerate(members):
                 if tier == "credits":
                     prio = CREDITS_PRIORITY["own" if own else "guest"]
                 elif tier == "exhausted":

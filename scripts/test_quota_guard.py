@@ -108,9 +108,9 @@ class SessionReserveTests(unittest.TestCase):
             self.assertEqual(mgmt.call_args_list[1].args, ('POST', '/credentials/refresh', {'name': 'test.json'}))
             self.assertEqual(mgmt.call_count, 3)
 
-    def run_guard(self, now, *, disabled=False, guard_disabled=False, burn=False, session=40, weekly=80, failed=False, scoped=None, guard_excluded=None, recovery=False):
+    def run_guard(self, now, *, owner="coworker", disabled=False, guard_disabled=False, burn=False, session=40, weekly=80, failed=False, scoped=None, guard_excluded=None, recovery=False):
         cred = {'name': 'coworker.json', 'email': 'coworker@example.com', 'type': 'claude',
-                'quota_owner': 'coworker', 'disabled': disabled, 'quota_burn': burn, 'priority': 101}
+                'quota_owner': owner, 'disabled': disabled, 'quota_burn': burn, 'priority': 101}
         if recovery:
             cred.update({'auth_index': 'test', 'cooldowns': [{'reason': 'quota', 'http_status': 429,
                          'model_key': 'claude-fable-5-2', 'retry_at': dt.datetime.fromtimestamp(now + 86400, dt.timezone.utc).isoformat(timespec='microseconds').replace('+00:00', '000Z')}],
@@ -123,7 +123,7 @@ class SessionReserveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)/'state.json'
             state.write_text(json.dumps({'claude:coworker@example.com': {'guard_disabled': guard_disabled, 'excluded': guard_excluded or {}}}))
-            with patch.object(g, 'STATE', str(state)), patch.object(g, 'STATUS', False), patch.object(g, 'DRY_RUN', False), patch.object(g.time, 'time', return_value=now), patch.object(g, 'mgmt', side_effect=mgmt), patch.object(g, 'claude_usage', side_effect=RuntimeError('unavailable') if failed else None, return_value=([weekly, now+86400], scoped or {}, [session, now+1000], now+1000 if recovery else None)), patch.object(g, 'set_guard_excludes', side_effect=lambda cred, old, new: writes.append(('exclusions', sorted(new)))), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(g, 'STATE', str(state)), patch.object(g, 'STATUS', False), patch.object(g, 'DRY_RUN', False), patch.object(g.time, 'time', return_value=now), patch.object(g, 'mgmt', side_effect=mgmt), patch.object(g, 'claude_usage', side_effect=RuntimeError('unavailable') if failed else None, return_value=([weekly, now+86400], scoped or {}, [session, now+1000], now+1000 if recovery else None)), patch.object(g, 'set_guard_excludes', side_effect=lambda cred, old, new: writes.append(('exclusions', sorted(new))) or new), contextlib.redirect_stdout(io.StringIO()):
                 g.main()
             return writes, json.loads(state.read_text())
 
@@ -155,6 +155,77 @@ class SessionReserveTests(unittest.TestCase):
                 self.assertFalse(state['claude:coworker@example.com']['guard_disabled'])
                 if remaining > 0:
                     self.assertIn(('exclusions', []), writes)
+
+    def test_fable_priority_uses_spendable_weekly_and_live_scoped_balance(self):
+        now = at('2026-11-15T16:00:00+00:00')
+        def share(weekly, fable, **kwargs):
+            window = [fable, kwargs.get('reset', now + 86400)]
+            scoped = {g.FABLE: window} if fable is not None else {}
+            return g.fable_share({'scoped': scoped}, weekly - kwargs.get('floor', 0), now)
+
+        self.assertLess(share(10, 0), share(90, 15))
+        self.assertLess(share(90, 15), share(25, 15))
+        self.assertLess(share(40, 15), share(45, 10, floor=35))
+        for unknown in (share(80, None), share(80, 0, reset=now), share(0, 61)):
+            self.assertGreater(unknown, share(1, 99))
+
+    def test_routing_priorities_protect_fable_within_normal_tiers(self):
+        now = at('2026-11-15T16:00:00+00:00')
+        cases = [
+            # The last guest has the earliest reset but the least weekly headroom.
+            ('spent', 'coworker', 70, 0, 6), ('spare', 'coworker', 85, 25, 5),
+            ('tight', 'coworker', 40, 50, 3), ('own', 'personal', 80, 90, 6),
+        ]
+        creds, state = [], {}
+        for name, owner, weekly, fable, days in cases:
+            reset = now + 86400 * days
+            creds.append({'name': name, 'email': name, 'type': 'claude', 'quota_owner': owner})
+            state['claude:' + name] = {'usage': {'overall': [weekly, reset], 'at': now,
+                'scoped': {g.FABLE: [fable, reset]}, 'session': [100, None]}}
+        priorities = {}
+        def mgmt(method, path, body=None):
+            if method == 'GET':
+                return {'files': creds}
+            if 'priority' in body:
+                priorities[body['name']] = body['priority']
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'state'
+            path.write_text(json.dumps(state))
+            with patch.object(g, 'STATE', str(path)), patch.object(g.time, 'time', return_value=now), patch.object(g, 'mgmt', side_effect=mgmt), patch.object(g, 'set_guard_excludes', side_effect=lambda cred, old, new: new), contextlib.redirect_stdout(io.StringIO()):
+                g.main()
+        self.assertEqual(sorted(priorities, key=priorities.get, reverse=True),
+                         ['own', 'spent', 'spare', 'tight'])
+
+    def test_personal_and_burn_exclude_only_exhausted_fable(self):
+        now = at('2026-11-15T16:00:00+00:00')
+        for owner, burn in [('personal', False), ('coworker', True)]:
+            scoped = {g.FABLE: [0, now + 86400], 'claude-opus-*': [10, now + 86400]}
+            _, state = self.run_guard(now, owner=owner, burn=burn, scoped=scoped)
+            account = state['claude:coworker@example.com']
+            self.assertEqual(account['excluded'], {g.FABLE: now + 86400})
+            self.assertFalse(account['guard_disabled'])
+
+    def test_manual_exclusions_survive_exhaustion_and_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(g, 'mgmt') as mgmt:
+            path = Path(tmp) / 'test.json'
+            cred = {'name': path.name, 'path': str(path)}
+            manual = 'claude-opus-*'
+            path.write_text(json.dumps({'excluded-models': [manual, g.FABLE]}))
+            self.assertEqual(g.set_guard_excludes(cred, set(), {g.FABLE}), set())
+            self.assertEqual(g.set_guard_excludes(cred, set(), set()), set())
+            mgmt.assert_not_called()
+
+            path.write_text(json.dumps({'excluded_models': [manual]}))
+            self.assertEqual(g.set_guard_excludes(cred, set(), {g.FABLE}), {g.FABLE})
+            added = mgmt.call_args.args[2]
+            self.assertEqual(added['excluded_models'], [manual, g.FABLE])
+            path.write_text(json.dumps(added))
+            mgmt.reset_mock()
+            self.assertEqual(g.set_guard_excludes(cred, set(), {g.FABLE}), {g.FABLE})
+            mgmt.assert_not_called()
+            g.set_guard_excludes(cred, set(), set())
+            self.assertEqual(mgmt.call_args.args[2]['excluded_models'], [manual])
 
     def test_fable_does_not_bypass_shared_limits(self):
         for date, weekly, session in [

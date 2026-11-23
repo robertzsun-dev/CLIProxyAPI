@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/modelscope"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
@@ -43,7 +44,8 @@ func (h *GeminiAPIHandler) HandlerType() string {
 func (h *GeminiAPIHandler) Models() []map[string]any {
 	// Get dynamic models from the global registry
 	modelRegistry := registry.GetGlobalRegistry()
-	return modelRegistry.GetAvailableModels("gemini")
+	cfg := h.CurrentConfig()
+	return modelscope.Catalog(cfg != nil && cfg.Client.NativeModelsOnly, "gemini", modelRegistry.GetAvailableModels("gemini"))
 }
 
 // GeminiModels handles the Gemini models listing endpoint.

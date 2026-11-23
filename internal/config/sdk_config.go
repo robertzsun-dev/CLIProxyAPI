@@ -127,8 +127,10 @@ func (c *SDKConfig) TLSHandshakeTimeout() time.Duration {
 
 // ClientConfig configures client-facing compatibility behavior.
 type ClientConfig struct {
-	Codex  CodexClientConfig  `yaml:"codex" json:"codex"`
-	Claude ClaudeClientConfig `yaml:"claude" json:"claude"`
+	NativeModelsOnly    bool               `yaml:"native-models-only,omitempty" json:"native-models-only,omitempty"`
+	OpenCodeLocalModels []string           `yaml:"opencode-local-models,omitempty" json:"opencode-local-models,omitempty"`
+	Codex               CodexClientConfig  `yaml:"codex" json:"codex"`
+	Claude              ClaudeClientConfig `yaml:"claude" json:"claude"`
 }
 
 // ClaudeClientConfig controls client-facing Claude protocol compatibility.

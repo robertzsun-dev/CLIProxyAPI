@@ -357,7 +357,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		routeDecision = h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
 	}
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
-	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
+	errMsg := h.nativeRouteError(ctx, entryProtocol, modelName, execOptions, routeDecision)
+	if errMsg == nil {
+		errMsg = validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision)
+	}
+	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)

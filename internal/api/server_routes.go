@@ -19,6 +19,7 @@ import (
 	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/models"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/grokbuild"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/modelscope"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/musecode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -750,6 +751,7 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context, clientVersion strin
 		models = append(models, formatHomeCodexModelWithSettings(entry, cfg))
 	}
 
+	models = modelscope.Catalog(cfg != nil && cfg.Client.NativeModelsOnly, "codex", models)
 	var webSearchCapabilityForModel codexmodels.WebSearchCapabilityForModelFunc
 	if clientVersion == "cpa" {
 		webSearchCapabilityForModel = homeWebSearchCapabilityForModel(entries)
@@ -1098,7 +1100,7 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 	if isClaude {
 		cfg := s.getConfig()
 		disableCloaking := cfg != nil && cfg.ClaudeCode.DisableCloakingModelList
-		s.writeModelListResponse(c, "claude", claudemodels.BuildResponse(formatHomeClaudeModels(entries), disableCloaking))
+		s.writeModelListResponse(c, "claude", claudemodels.BuildResponse(modelscope.Catalog(cfg != nil && cfg.Client.NativeModelsOnly, "claude", formatHomeClaudeModels(entries)), disableCloaking))
 		return
 	}
 
@@ -1118,7 +1120,7 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 	}
 	s.writeModelListResponse(c, "openai", gin.H{
 		"object": "list",
-		"data":   filtered,
+		"data":   s.handlers.NativeClientCatalog("openai", c.Request.Header, filtered),
 	})
 }
 
@@ -1159,17 +1161,21 @@ func formatHomeClaudeModel(entry homeModelEntry) map[string]any {
 }
 
 func (s *Server) handleHomeGeminiModels(c *gin.Context) {
+	cfg := s.getConfig()
+	nativeOnly := cfg != nil && cfg.Client.NativeModelsOnly
 	entries, ok := s.loadHomeModelEntries(c)
 	if !ok {
 		return
 	}
 
 	s.writeModelListResponse(c, "gemini", gin.H{
-		"models": formatHomeGeminiModels(entries),
+		"models": modelscope.Catalog(nativeOnly, "gemini", formatHomeGeminiModels(entries)),
 	})
 }
 
 func (s *Server) handleHomeGeminiModel(c *gin.Context) {
+	cfg := s.getConfig()
+	nativeOnly := cfg != nil && cfg.Client.NativeModelsOnly
 	entries, ok := s.loadHomeModelEntries(c)
 	if !ok {
 		return
@@ -1178,7 +1184,7 @@ func (s *Server) handleHomeGeminiModel(c *gin.Context) {
 	action := strings.TrimPrefix(c.Param("action"), "/")
 	action = strings.TrimSpace(action)
 	for _, entry := range entries {
-		if homeGeminiModelMatches(entry, action) {
+		if (!nativeOnly || modelscope.Allows("gemini", entry.id)) && homeGeminiModelMatches(entry, action) {
 			c.JSON(http.StatusOK, formatHomeGeminiModel(entry))
 			return
 		}

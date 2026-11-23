@@ -9,10 +9,12 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/modelscope"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"golang.org/x/net/context"
@@ -96,6 +98,80 @@ func excludeExecutionProvider(providers []string, excluded string) []string {
 	out = append(out, providers[:excludedIndex]...)
 	out = append(out, providers[excludedIndex+1:]...)
 	return out
+}
+
+func nativeClientFamily(protocol string, headers http.Header) string {
+	switch protocol {
+	case OpenAI, OpenaiResponse:
+		ua := strings.ToLower(headers.Get("User-Agent"))
+		switch {
+		case coreauth.IsCodexClientUserAgent(ua) || coreauth.IsCodexClientUserAgent(headers.Get("Originator")):
+			return Codex
+		case strings.HasPrefix(ua, "muse-code") || strings.HasPrefix(ua, "muse/"):
+			return "muse"
+		case strings.Contains(ua, "opencode") || headers.Get("X-T3-Harness") == "opencode":
+			return "opencode"
+		default:
+			return ""
+		}
+	case Antigravity:
+		return Gemini
+	case Claude, Codex, Gemini:
+		return protocol
+	default:
+		return ""
+	}
+}
+
+// NativeModelError checks a model before a native client can submit it for inference.
+func (h *BaseAPIHandler) NativeModelError(protocol string, headers http.Header, model string) *interfaces.ErrorMessage {
+	cfg := h.CurrentConfig()
+	if cfg == nil || !cfg.Client.NativeModelsOnly {
+		return nil
+	}
+	family := nativeClientFamily(protocol, headers)
+	allowed := modelscope.Allows(family, model)
+	if family == "opencode" {
+		allowed = slices.Contains(cfg.Client.OpenCodeLocalModels, thinking.ParseSuffix(model).ModelName)
+	}
+	if allowed {
+		return nil
+	}
+	return &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("model %q is outside the %s client model family", model, family)}
+}
+
+// NativeClientCatalog filters unified model listings only when the caller identifies its harness.
+func (h *BaseAPIHandler) NativeClientCatalog(protocol string, headers http.Header, models []map[string]any) []map[string]any {
+	cfg := h.CurrentConfig()
+	if cfg == nil || !cfg.Client.NativeModelsOnly || nativeClientFamily(protocol, headers) == "" {
+		return models
+	}
+	result := make([]map[string]any, 0, len(models))
+	for _, row := range models {
+		id, _ := row["id"].(string)
+		if h.NativeModelError(protocol, headers, id) == nil {
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+func (h *BaseAPIHandler) nativeRouteError(ctx context.Context, protocol, model string, opts modelExecutionOptions, route modelRouteDecision) *interfaces.ErrorMessage {
+	cfg := h.CurrentConfig()
+	if cfg == nil || !cfg.Client.NativeModelsOnly {
+		return nil
+	}
+	headers := opts.Headers
+	if len(headers) == 0 {
+		headers = headersFromContext(ctx)
+	}
+	if errMsg := h.NativeModelError(protocol, headers, model); errMsg != nil {
+		return errMsg
+	}
+	if route.Model != "" && route.Model != model {
+		return h.NativeModelError(protocol, headers, route.Model)
+	}
+	return nil
 }
 
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {

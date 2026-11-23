@@ -386,6 +386,11 @@ func truncateWebsocketCloseReason(reason string, maxBytes int) string {
 }
 
 func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Context, baseReq *http.Request, payload []byte, requestModelName string, updateRequestContext bool) (string, *interfaces.ErrorMessage) {
+	if h != nil && c != nil && c.Request != nil && requestModelName != "" {
+		if errMsg := h.NativeModelError(h.HandlerType(), c.Request.Header, requestModelName); errMsg != nil {
+			return "", errMsg
+		}
+	}
 	if h == nil || h.AccessManager == nil {
 		return "", nil
 	}

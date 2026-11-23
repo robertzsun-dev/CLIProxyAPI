@@ -8,6 +8,7 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/modelscope"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 )
@@ -182,12 +183,14 @@ func (h *Handler) HandleModels(c *gin.Context) {
 	}
 
 	var homeEnabled bool
+	var nativeOnly bool
 	var homeLoader HomeModelsLoader
 	var listWriter ModelListWriter
 
 	if h != nil {
 		h.mu.RLock()
 		cfg := h.cfg
+		nativeOnly = cfg != nil && cfg.Client.NativeModelsOnly
 		authManager := h.authManager
 		homeLoader = h.homeModelsLoader
 		listWriter = h.modelListWriter
@@ -210,6 +213,15 @@ func (h *Handler) HandleModels(c *gin.Context) {
 		inputs = ModelInputsFromGlobalRegistry(registry.GetGlobalRegistry())
 	}
 
+	if nativeOnly {
+		local := make([]ModelInput, 0, len(inputs))
+		for _, model := range inputs {
+			if modelscope.Allows("muse", model.ID) {
+				local = append(local, model)
+			}
+		}
+		inputs = local
+	}
 	payload := BuildModelsResponse(inputs)
 	body, errMarshal := MarshalCompact(payload)
 	if errMarshal != nil {

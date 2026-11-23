@@ -80,7 +80,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	}
 
 	// Get all available models
-	allModels := h.Models()
+	allModels := h.NativeClientCatalog(h.HandlerType(), c.Request.Header, h.Models())
 
 	// Filter to only include the 4 required fields: id, object, created, owned_by
 	filteredModels := make([]map[string]any, len(allModels))

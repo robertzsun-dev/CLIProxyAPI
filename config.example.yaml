@@ -421,6 +421,10 @@ requests:
 
 # Client-facing compatibility settings apply to both OAuth and API-key routes.
 client:
+  # Limit native Claude, Codex, Gemini and Muse clients to their respective model families.
+  native-models-only: false
+  # Exact self-hosted model IDs that OpenCode may use through this proxy in native-only mode.
+  opencode-local-models: []
   codex:
     # When false (default), only models that natively declare freeform apply_patch advertise it.
     # When true, non-template and bridged models supported by every routing executor also advertise "freeform".

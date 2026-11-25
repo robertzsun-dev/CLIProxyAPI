@@ -1,5 +1,5 @@
 [Unit]
-Description=Protect pooled coworker weekly and work-hours Claude session quotas
+Description=Protect pooled coworker weekly quota reserves
 
 [Service]
 Type=oneshot

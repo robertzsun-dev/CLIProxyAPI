@@ -2,14 +2,6 @@
 """Order CLIProxyAPI's Claude/Codex accounts by weekly reset, and hold the
 accounts that aren't Robert's to quota floors.
 
-Coworker Claude accounts retain 50% of their five-hour session allowance on
-weekdays from 08:00 to 18:00 America/Los_Angeles (including DST). This reserve
-also applies to burn/final tiers and the Burn switch. Missing or stale session
-usage holds the credential until fresh usage confirms it is above the floor.
-A fresh weekly-only response with an explicit null session has no session reserve.
-This polling guard stops new routed requests; it cannot reclaim usage consumed
-by requests already in flight or by the account owner outside this proxy.
-
 CLIProxyAPI only routes to the highest-priority available accounts, so the
 guard rewrites priorities every run (larger is used first):
 
@@ -41,7 +33,7 @@ percent or less left, BURN_FLOOR within BURN_WINDOW of the reset, or 0% within
 FINAL_WINDOW (the remainder is lost at the reset anyway), and are
 re-enabled when the window resets or when the burn window opens with quota above
 BURN_FLOOR. Claude's Fable-specific allowance may be used down to 0%; the
-overall weekly and work-hours session reserves still apply. Other model-scoped
+overall weekly reserve still applies. Other model-scoped
 weekly limits get the same floors by excluding just that model family.
 
 Stale Codex "quota" cooldowns are cleared once fresh usage shows the account has
@@ -82,7 +74,6 @@ credits tier as usual.
 import datetime as dt
 import json
 import math
-from zoneinfo import ZoneInfo
 import os
 import re
 import sys
@@ -153,59 +144,7 @@ def epoch(iso):
     return int(dt.datetime.fromisoformat(iso).timestamp())
 
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
-SESSION_RESERVE = 50
-SESSION_MAX_AGE = 120
-
-
-def work_hours(now):
-    local = dt.datetime.fromtimestamp(now, PACIFIC)
-    return local.weekday() < 5 and 8 <= local.hour < 18
-
-
-def claude_session_window(usage):
-    window = usage.get("five_hour")
-    if window is not None:
-        used, reset = window.get("utilization"), window.get("resets_at")
-    else:
-        window = next((w for w in usage.get("limits") or [] if w.get("kind") == "session"), None)
-        if window is None:
-            # Verified Ultra accounts report an explicit null session alongside weekly limits.
-            weekly = next((w for w in usage.get("limits") or [] if w.get("kind") == "weekly_all"), None)
-            if "five_hour" not in usage or weekly is None:
-                return None
-            used = weekly.get("percent")
-            if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used <= 100:
-                return None
-            try:
-                epoch(weekly.get("resets_at"))
-            except (ValueError, TypeError):
-                return None
-            return [100, None]
-        used, reset = window.get("percent"), window.get("resets_at")
-    if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used <= 100:
-        return None
-    # An unused session legitimately has no reset time. A used session does not.
-    if reset is None and used != 0:
-        return None
-    try:
-        return [100 - used, epoch(reset) if reset else None]
-    except (ValueError, TypeError):
-        return None
-
-
-def session_hold(kind, own, usage, now):
-    if kind != "claude" or own or not work_hours(now):
-        return None
-    window = (usage or {}).get("session")
-    if not window or now - usage.get("at", 0) > SESSION_MAX_AGE:
-        return "five-hour quota unknown or stale"
-    remaining, reset = window
-    if reset is not None and now >= reset:
-        return "five-hour reset needs fresh quota"
-    if remaining <= SESSION_RESERVE:
-        return f"{remaining:.0f}% five-hour quota left; reserving {SESSION_RESERVE}%"
-    return None
+RECOVERY_MAX_AGE = 120
 
 
 def claude_usage(cred):
@@ -221,20 +160,22 @@ def claude_usage(cred):
                 scoped[f"claude-{name.lower()}-*"] = [100 - lim["percent"], epoch(lim["resets_at"])]
     if overall is None and u.get("seven_day"):
         overall = [100 - u["seven_day"]["utilization"], epoch(u["seven_day"]["resets_at"])]
-    return overall, scoped, claude_session_window(u), claude_recovery_until(u, time.time())
+    return overall, scoped, claude_recovery_until(u, time.time())
 
 
 def claude_recovery_until(usage, now):
     """Earliest reset in a complete, healthy observation, or None if unproven."""
     limits = usage.get("limits")
-    if not isinstance(limits, list) or not limits or "five_hour" not in usage:
+    if not isinstance(limits, list) or not limits:
         return None
     deadlines = []
     kinds = []
     try:
         for limit in limits:
             kind, used = limit.get("kind"), limit.get("percent")
-            if kind not in ("weekly_all", "weekly_scoped", "session"):
+            if kind == "session":
+                continue
+            if kind not in ("weekly_all", "weekly_scoped"):
                 return None
             if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used < 100:
                 return None
@@ -243,9 +184,6 @@ def claude_recovery_until(usage, now):
                 if scope.get("surface") or not (scope.get("model") or {}).get("display_name"):
                     return None
             reset = limit.get("resets_at")
-            if reset is None and kind == "session" and used == 0:
-                kinds.append(kind)
-                continue
             deadline = epoch(reset)
             if deadline <= now:
                 return None
@@ -254,16 +192,12 @@ def claude_recovery_until(usage, now):
         if kinds.count("weekly_all") != 1:
             return None
         # The legacy fields can contradict a partially updated limits list.
-        for name in ("five_hour", "seven_day"):
-            window = usage.get(name)
-            if window is None:
-                continue
+        window = usage.get("seven_day")
+        if window is not None:
             used = window.get("utilization")
             if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used < 100:
                 return None
             reset = window.get("resets_at")
-            if name == "five_hour" and reset is None and used == 0:
-                continue
             deadline = epoch(reset)
             if deadline <= now:
                 return None
@@ -278,7 +212,7 @@ def claude_quota_recoverable(cred, state, now):
     checked = usage.get("at", 0)
     if cred.get("disabled") or cred.get("requires_sign_in"):
         return False
-    if not 0 <= now - checked <= SESSION_MAX_AGE or (usage.get("claude_recovery_until") or 0) <= now:
+    if not 0 <= now - checked <= RECOVERY_MAX_AGE or (usage.get("claude_recovery_until") or 0) <= now:
         return False
     if now - state.get("claude_recovery_at", 0) < OWN_TTL:
         return False
@@ -296,7 +230,7 @@ def claude_quota_recoverable(cred, state, now):
         try:
             if epoch(cooldown.get("retry_at")) - now <= OWN_TTL:
                 return False
-            if checked - epoch(observation.get("observed_at")) < SESSION_MAX_AGE:
+            if checked - epoch(observation.get("observed_at")) < RECOVERY_MAX_AGE:
                 return False
         except (ValueError, TypeError, OverflowError):
             return False
@@ -498,6 +432,9 @@ def main():
             change(f"{key}: quota_owner unset -> {owner} (default)",
                    mgmt, "PATCH", "/credentials/fields", {"name": cred["name"], "quota_owner": owner})
         st = state.setdefault(key, {})
+        st.pop("session_hold", None)
+        if st.get("usage"):
+            st["usage"].pop("session", None)
         if cred.get("disabled") and not st.get("guard_disabled"):
             continue  # disabled by hand; not ours to manage
 
@@ -507,33 +444,24 @@ def main():
         ttl = OWN_TTL if own and not near else GUEST_TTL
         if kind == "claude" and FABLE in ((cached or {}).get("scoped") or {}):
             ttl = GUEST_TTL
-        if kind == "claude" and not own and work_hours(now):
-            ttl = 30  # The proxy coalesces upstream usage reads in its shared cache.
         stale = (not cached or now - cached["at"] > ttl or (cached["overall"] and now >= cached["overall"][1])
                  or (kind == "codex" and "credits" not in cached)
-                 or (kind == "claude" and ("session" not in cached or
-                     any(now >= w[1] for w in (cached.get("scoped") or {}).values()) or
-                     (cached.get("session") and cached["session"][1] is not None and now >= cached["session"][1]))))
-        # Recheck guard-disabled accounts too: their five-hour window can reset
-        # before the weekly window. upstream_get refreshes expired tokens once.
+                 or (kind == "claude" and any(now >= w[1] for w in (cached.get("scoped") or {}).values())))
         if stale and not STATUS:
             try:
                 if kind == "claude":
-                    overall, scoped, session, recovery_until = claude_usage(cred)
+                    overall, scoped, recovery_until = claude_usage(cred)
                     credits = None
                 else:
                     overall, scoped, credits = codex_usage(cred)
-                    session = None
                     recovery_until = None
-                st["usage"] = cached = {"overall": overall, "scoped": scoped, "credits": credits, "session": session, "at": now}
+                st["usage"] = cached = {"overall": overall, "scoped": scoped, "credits": credits, "at": now}
                 if kind == "claude":
                     cached["claude_recovery_until"] = recovery_until
             except Exception as err:
                 print(f"{key}: usage check failed ({err}); using last known usage")
         if not cached:
-            if kind != "claude" or own or not work_hours(now):
-                continue
-            st["usage"] = {"overall": None, "scoped": {}, "credits": None, "session": None, "at": 0}
+            continue
         accounts.append((cred, key, own, st))
 
     for cred, key, own, st in accounts:
@@ -561,14 +489,11 @@ def main():
         floor = 0 if burn else floor_for(own, reset, now)
         # A guest at its plan limit with credits is only billing credits (last resort).
         want_off = not own and not burn and remaining <= floor and not billing_credits(st["usage"], now)
-        hold = session_hold(cred.get("type") or cred.get("provider"), own, st["usage"], now)
-        want_off = want_off or hold is not None
-        st["session_hold"] = hold
         if want_off != bool(cred.get("disabled")) and not STATUS:
             verb = (f"disabled until {when(reset)}" if want_off else
                     "re-enabled (plan limit reached; credits only, last resort)" if billing_credits(st["usage"], now)
                     else "re-enabled")
-            change(f"{key}: {hold or f'{remaining:.0f}% weekly left, floor {floor}%'} -> {verb}",
+            change(f"{key}: {remaining:.0f}% weekly left, floor {floor}% -> {verb}",
                    mgmt, "PATCH", "/credentials/status", {"name": cred["name"], "disabled": want_off})
             cred["disabled"] = want_off
         st["guard_disabled"] = want_off
@@ -642,13 +567,6 @@ def main():
         print(f"{'account':42} {'owner':13} {'prio':>4}  {'tier':9} {'left':>5}  {'floor':>5}  {'weekly reset':15} {'state':5} credits")
         for kind, _, key, owner, prio, tier, remaining, reset, floor, disabled, credits in sorted(rows):
             print(f"{key:42} {owner:13} {prio:>4}  {tier:9} {remaining:>4.0f}%  {floor:>4}%  {when(reset):15} {'OFF' if disabled else 'on':5} {credits}")
-        for cred, key, own, st in accounts:
-            if (cred.get("type") or cred.get("provider")) == "claude" and not own:
-                window = st["usage"].get("session")
-                left = f"{window[0]:.0f}%" if window else "unknown"
-                print(f"{key}: five-hour left {left}; work-hours reserve "
-                      f"{'active' if work_hours(now) else 'inactive'}; "
-                      f"{st.get('session_hold') or 'no session hold'}")
         return 0
 
     if not DRY_RUN:

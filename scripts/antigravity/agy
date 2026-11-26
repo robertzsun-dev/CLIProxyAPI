@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+GEMINI_API_KEY=$(cat "$HOME/.config/cliproxy-clients/key")
+export GEMINI_API_KEY
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:18317
+exec "$HOME/.local/lib/antigravity-cli/agy" "$@"

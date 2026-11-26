@@ -1,0 +1,11 @@
+[Unit]
+Description=Antigravity Gemini stream compatibility proxy
+
+[Service]
+EnvironmentFile=%h/.config/cliproxy-clients/antigravity-stream.env
+ExecStart=%h/.local/lib/antigravity-stream/antigravity-stream
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
